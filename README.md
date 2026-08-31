@@ -6,7 +6,7 @@
 
 2.It sets up all the others so they're 'on the same page'. 
 
-3.shared context, memory, skills etc.**
+3.shared context, memory, skills etc.
  
 --
 ## Overview

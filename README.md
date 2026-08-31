@@ -1,114 +1,86 @@
 # samepage
 
-**Authenticate the one coding agent you trust. It sets up all the others — on
-the same page, with no context gap.**
+**Authenticate the one coding agent you trust. It sets up all the others —
+on the same page, with no context gap.**
 
-Running Claude Code, Codex, and Gemini CLI side by side is easy now (tmux,
-[cmux](https://cmux.com), [claude-squad](https://github.com/smtg-ai/claude-squad)).
-What's still annoying is that each agent has its own context file, its own
-skills folder, its own memory — so what one agent learns, the others never
-see. And setting up agents two through seven is the same tedious dance every
-time.
+Running Claude Code, Codex, and Gemini side by side is easy now. Keeping
+them on the same page isn't: each has its own context file, skills folder,
+and memory, so what one learns the others never see — and every added agent
+repeats the same setup dance.
 
-samepage is a small fix for both:
+samepage fixes both:
 
 1. **One shared layer per project.** `AGENTS.md` is the single source of
-   truth; `CLAUDE.md`, `GEMINI.md`, etc. are symlinks to it. Skills live in
-   `.samepage/skills/`, shared memory in `.samepage/memory/MEMORY.md`, and
-   every agent's context file tells it to read memory at session start and
-   append durable facts before finishing. No copies, no drift, no gap.
-2. **One trusted agent bootstraps the rest.** You authenticate a single
-   provider — whichever you trust — and `samepage bootstrap` hands it a short
-   prompt. That agent then installs the other CLIs (asking first), walks you
-   through each login, wires each one to the shared layer, and **verifies**
-   each agent can actually answer questions from the shared context before
-   calling it done. If you're in tmux or cmux, it offers to open one pane per
-   agent.
+   truth; `CLAUDE.md`, `GEMINI.md`, … are symlinks to it. Skills live in
+   `.samepage/skills/`, memory in `.samepage/memory/MEMORY.md`. Every agent
+   reads memory at session start and appends durable facts before finishing.
+   No copies, no drift.
+2. **One trusted agent bootstraps the rest.** `samepage bootstrap` hands
+   your chosen agent a short prompt. It installs the other CLIs (asking
+   first), walks you through each login, wires each to the shared layer, and
+   verifies each can answer from it before calling it done. Inside tmux or
+   [cmux](https://cmux.com), it offers one pane per agent.
 
 ## Requirements
 
-- macOS or Linux (Windows via WSL), any terminal — cmux/tmux are optional;
-  the bootstrap only offers panes if you're already inside one.
+- macOS or Linux (Windows via WSL). Any terminal; tmux/cmux optional.
 - git.
-- **One** coding-agent CLI installed and authenticated — whichever provider
-  you trust. Everything else gets installed later, by that agent, with your
-  say-so.
+- One coding-agent CLI, installed and authenticated. The rest come later.
 
-No server, no database, no background process. The shared layer is plain
-files in your repo.
+No server, no daemon, no database — the shared layer is plain files in your
+repo.
 
 ## Quick start
 
 ```sh
 git clone https://github.com/shreyasnivas/samepage
-ln -s "$PWD/samepage/bin/samepage" ~/.local/bin/samepage   # or anywhere on your PATH
+ln -s "$PWD/samepage/bin/samepage" ~/.local/bin/samepage
 
 cd your-project
-samepage init         # create the shared layer, link the agent files to it
-samepage bootstrap    # pick the provider you trust — it takes it from there
+samepage init         # create the shared layer
+samepage bootstrap    # pick your provider — it takes it from there
 ```
-
-That's it. `samepage doctor` shows the state of the world at any time;
-`samepage sync` re-creates the symlinks after a fresh clone.
-
-## How it works
-
-There are only three moving parts, all of them boring on purpose:
-
-- **`templates/AGENTS.md`** — the shared-context contract. It includes "the
-  samepage protocol": where memory lives, where skills live, and the rule
-  that agents append durable facts before finishing a session. Ships with a
-  `remember` skill that any skills-capable agent can use.
-- **`bin/samepage`** — ~200 lines of dependency-free bash. It creates the
-  layer, makes the symlinks for the common agents, and knows how to launch
-  your chosen provider with the bootstrap prompt.
-- **`templates/BOOTSTRAP.md`** — the prompt. This is the actual product.
-
-### The adapter table is a prompt, not code
-
-Tools that sync config across agents maintain a hardcoded table of every
-agent's file format, and chase it as the tools change weekly. samepage keeps
-the deterministic core tiny (symlinks for the big three) and delegates the
-long tail to the model you already trust — at setup time, against the
-providers' current docs, with a verification step so "wired up" is something
-proven, not assumed. When a new agent CLI ships next month, nothing here
-needs an update: your bootstrap agent reads its docs and wires it in.
-
-## What it deliberately doesn't do
-
-samepage is glue, not a platform. If you need more, these are good and
-compose with it:
-
-- [cmux](https://github.com/manaflow-ai/cmux) / [claude-squad](https://github.com/smtg-ai/claude-squad) /
-  [amux](https://github.com/mixpeek/amux) — the panes, tabs, and worktrees.
-  samepage runs happily inside any of them.
-- [ruler](https://github.com/intellectronica/ruler) — maintained per-agent
-  config distribution for ~17 agents. `samepage sync` detects it and points
-  you at `ruler apply` for agents it doesn't link natively.
-- [agentmemory](https://github.com/rohitg00/agentmemory) /
-  [OpenViking](https://github.com/volcengine/OpenViking) — real shared-memory
-  servers over MCP. samepage's markdown memory file is the zero-dependency
-  version; graduate when you outgrow it.
-
-## Caveats
-
-- The install/auth hints in `samepage doctor` are best-effort snapshots; the
-  bootstrap agent is told to verify against current provider docs rather than
-  trust them.
-- Symlinked context files assume the agent follows symlinks (the big three
-  do). `samepage doctor` will tell you if a link got replaced by a real file.
-- Shared memory is a plain markdown file with a protocol, not a database.
-  That's a feature until it isn't; see the upgrade paths above.
 
 ## Commands
 
-| command | what it does |
+| command | does |
 | --- | --- |
-| `samepage init [dir]` | create `AGENTS.md`, `.samepage/{memory,skills}`, and the symlinks |
-| `samepage bootstrap [provider]` | hand setup of all other agents to the one you trust |
-| `samepage doctor` | which agents are installed, and is the shared layer intact |
-| `samepage sync` | re-create the symlinks (after cloning, or adding agents) |
+| `samepage init [dir]` | create `AGENTS.md`, `.samepage/`, and the symlinks |
+| `samepage bootstrap [provider]` | hand setup of the other agents to the one you trust |
+| `samepage doctor` | what's installed, is the layer intact |
+| `samepage sync` | re-create the symlinks after a fresh clone |
 
-## License
+## The adapter table is a prompt, not code
+
+Config-sync tools hardcode every agent's file format and chase changes
+forever. samepage keeps the deterministic core tiny — symlinks for the big
+three — and delegates the long tail to the model you trust, at setup time,
+against current docs, with verification. A new agent CLI ships tomorrow?
+Nothing here changes; your bootstrap agent reads its docs and wires it in.
+
+The prompt is [`templates/BOOTSTRAP.md`](templates/BOOTSTRAP.md). That's the
+product. The bash is plumbing.
+
+## Glue, not a platform
+
+- Panes and worktrees: [cmux](https://github.com/manaflow-ai/cmux),
+  [claude-squad](https://github.com/smtg-ai/claude-squad),
+  [amux](https://github.com/mixpeek/amux). samepage runs inside any of them.
+- Maintained per-agent config sync:
+  [ruler](https://github.com/intellectronica/ruler). `samepage sync` points
+  you at it for agents it doesn't link natively.
+- Real shared-memory servers:
+  [agentmemory](https://github.com/rohitg00/agentmemory),
+  [OpenViking](https://github.com/volcengine/OpenViking). Graduate when a
+  markdown file isn't enough.
+
+## Caveats
+
+- Install/auth hints are snapshots; the bootstrap agent verifies against
+  current provider docs instead of trusting them.
+- Symlinked context assumes the agent follows symlinks (the big three do).
+  `doctor` flags a link replaced by a real file.
+- Memory is a markdown file with a protocol, not a database. A feature,
+  until it isn't.
 
 MIT

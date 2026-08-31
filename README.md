@@ -3,7 +3,9 @@
 **Coding with Claude Code, Codex, and Gemini side by side is easy now.**
 --
 1.Authenticate the one coding agent you trust.
+
 2.It sets up all the others so they're 'on the same page'. 
+
 3.shared context, memory, skills etc.**
  
 --

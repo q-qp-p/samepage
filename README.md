@@ -1,20 +1,16 @@
 # samepage
 
-**Authenticate the one coding agent you trust. It sets up all the others —
-on the same page, with no context gap.**
+**Authenticate the one coding agent you trust. It sets up all the others so they're 'on the same page'. shared context, memory, skills.**
 
-Running Claude Code, Codex, and Gemini side by side is easy now. Keeping
-them on the same page isn't: each has its own context file, skills folder,
-and memory, so what one learns the others never see — and every added agent
-repeats the same setup dance.
-
-samepage fixes both:
+code seamlessly across worktrees with any frontier model
+Claude Code, Codex, and Gemini side by side is easy now. 
 
 1. **One shared layer per project.** `AGENTS.md` is the single source of
    truth; `CLAUDE.md`, `GEMINI.md`, … are symlinks to it. Skills live in
    `.samepage/skills/`, memory in `.samepage/memory/MEMORY.md`. Every agent
    reads memory at session start and appends durable facts before finishing.
    No copies, no drift.
+   
 2. **One trusted agent bootstraps the rest.** `samepage bootstrap` hands
    your chosen agent a short prompt. It installs the other CLIs (asking
    first), walks you through each login, wires each to the shared layer, and
@@ -26,9 +22,6 @@ samepage fixes both:
 - macOS or Linux (Windows via WSL). Any terminal; tmux/cmux optional.
 - git.
 - One coding-agent CLI, installed and authenticated. The rest come later.
-
-No server, no daemon, no database — the shared layer is plain files in your
-repo.
 
 ## Quick start
 

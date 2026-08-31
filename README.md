@@ -1,17 +1,20 @@
 # samepage
 
-**Authenticate the one coding agent you trust. It sets up all the others so they're 'on the same page'. shared context, memory, skills.**
-
-code seamlessly across worktrees with any frontier model
-Claude Code, Codex, and Gemini side by side is easy now. 
-
-1. **One shared layer per project.** `AGENTS.md` is the single source of
+**Coding with Claude Code, Codex, and Gemini side by side is easy now.**
+--
+**1.Authenticate the one coding agent you trust. 
+2.It sets up all the others so they're 'on the same page'. 
+3. shared context, memory, skills etc.**
+ 
+--
+## Overview
+- **One shared layer per project.** `AGENTS.md` is the single source of
    truth; `CLAUDE.md`, `GEMINI.md`, … are symlinks to it. Skills live in
    `.samepage/skills/`, memory in `.samepage/memory/MEMORY.md`. Every agent
    reads memory at session start and appends durable facts before finishing.
    No copies, no drift.
    
-2. **One trusted agent bootstraps the rest.** `samepage bootstrap` hands
+- **One trusted agent bootstraps the rest.** `samepage bootstrap` hands
    your chosen agent a short prompt. It installs the other CLIs (asking
    first), walks you through each login, wires each to the shared layer, and
    verifies each can answer from it before calling it done. Inside tmux or

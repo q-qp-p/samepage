@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# samepage — one shared context layer for every coding agent,
+# bootstrapped by the one you trust.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+realpath_py() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+SCRIPT_PATH="$(realpath_py "${BASH_SOURCE[0]}")"
+ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
+TEMPLATES="$ROOT/templates"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+warn() { printf '\033[33m! %s\033[0m\n' "$*"; }
+ok()   { printf '\033[32m+ %s\033[0m\n' "$*"; }
+bad()  { printf '\033[31mx %s\033[0m\n' "$*"; }
+die()  { bad "$*"; exit 1; }
+
+# name|binary|install hint|auth hint
+# Hints are best-effort and may drift; the bootstrap agent verifies against
+# each provider's docs at setup time (that's the whole design).
+AGENTS=(
+  "claude|claude|npm install -g @anthropic-ai/claude-code|run 'claude' once and follow the login prompt"
+  "codex|codex|npm install -g @openai/codex|codex login"
+  "gemini|gemini|npm install -g @google/gemini-cli|run 'gemini' once and pick a login method"
+  "opencode|opencode|brew install sst/tap/opencode|opencode auth login"
+  "amp|amp|npm install -g @sourcegraph/amp|run 'amp' once and follow the login prompt"
+  "goose|goose|brew install block-goose-cli|goose configure"
+  "aider|aider|python -m pip install aider-install && aider-install|export your provider API key"
+)
+
+agent_row() { # $1 = name -> echoes matching row, or fails
+  local row
+  for row in "${AGENTS[@]}"; do
+    case "$row" in "$1|"*) printf '%s\n' "$row"; return 0 ;; esac
+  done
+  return 1
+}
+
+link_one() { # $1 = link path, $2 = target (relative to link's directory)
+  if [ -L "$1" ]; then
+    ok "$1 -> $(readlink "$1") (already linked)"
+  elif [ -e "$1" ]; then
+    warn "$1 exists and is not a symlink — left untouched (merge its content into AGENTS.md, delete it, then rerun 'samepage sync')"
+  else
+    ln -s "$2" "$1"
+    ok "$1 -> $2"
+  fi
+}
+
+link_agents() {
+  link_one CLAUDE.md AGENTS.md
+  link_one GEMINI.md AGENTS.md
+  mkdir -p .claude
+  link_one .claude/skills ../.samepage/skills
+  if command -v ruler >/dev/null 2>&1; then
+    info "ruler detected — 'ruler apply' can cover agents samepage doesn't link natively"
+  fi
+}
+
+cmd_init() {
+  local target="${1:-.}"
+  mkdir -p "$target"
+  cd "$target"
+  mkdir -p .samepage/memory .samepage/skills
+  if [ -f AGENTS.md ]; then
+    info "AGENTS.md already exists — keeping yours"
+  else
+    cp "$TEMPLATES/AGENTS.md" AGENTS.md
+    ok "AGENTS.md created (edit the project-context section)"
+  fi
+  [ -f .samepage/memory/MEMORY.md ] || cp "$TEMPLATES/MEMORY.md" .samepage/memory/MEMORY.md
+  [ -f .samepage/BOOTSTRAP.md ] || cp "$TEMPLATES/BOOTSTRAP.md" .samepage/BOOTSTRAP.md
+  [ -d .samepage/skills/remember ] || cp -R "$TEMPLATES/skills/remember" .samepage/skills/remember
+  link_agents
+  bold "Next: samepage bootstrap"
+}
+
+cmd_sync() {
+  [ -f AGENTS.md ] || die "no AGENTS.md here — run 'samepage init' first"
+  mkdir -p .samepage/memory .samepage/skills
+  link_agents
+}
+
+cmd_doctor() {
+  local row name bin inst auth
+  bold "agent CLIs"
+  for row in "${AGENTS[@]}"; do
+    IFS='|' read -r name bin inst auth <<EOF
+$row
+EOF
+    if command -v "$bin" >/dev/null 2>&1; then
+      ok "$name"
+    else
+      bad "$name — not installed (try: $inst)"
+    fi
+  done
+  bold "shared layer"
+  [ -f AGENTS.md ] && ok "AGENTS.md" || bad "AGENTS.md missing — run 'samepage init'"
+  [ -f .samepage/memory/MEMORY.md ] && ok ".samepage/memory/MEMORY.md" || bad "shared memory missing"
+  [ -d .samepage/skills ] && ok ".samepage/skills/" || bad "shared skills dir missing"
+  local l
+  for l in CLAUDE.md GEMINI.md .claude/skills; do
+    if [ -L "$l" ]; then
+      ok "$l -> $(readlink "$l")"
+    elif [ -e "$l" ]; then
+      warn "$l is a real file/dir, not a symlink — that's a context gap waiting to happen"
+    else
+      bad "$l not linked — run 'samepage sync'"
+    fi
+  done
+  return 0
+}
+
+cmd_bootstrap() {
+  if [ ! -f AGENTS.md ] || [ ! -d .samepage ]; then
+    info "no shared layer here yet — running init first"
+    cmd_init .
+  fi
+
+  local pick="${1:-}" row name bin inst auth i n
+  if [ -z "$pick" ]; then
+    bold "Which provider do you trust most?"
+    i=1
+    for row in "${AGENTS[@]}"; do
+      IFS='|' read -r name bin inst auth <<EOF
+$row
+EOF
+      if command -v "$bin" >/dev/null 2>&1; then
+        printf '  %d) %s (installed)\n' "$i" "$name"
+      else
+        printf '  %d) %s\n' "$i" "$name"
+      fi
+      i=$((i + 1))
+    done
+    printf '> '
+    read -r pick
+  fi
+
+  # accept a number or a name
+  case "$pick" in
+    [1-9])
+      [ "$pick" -le "${#AGENTS[@]}" ] || die "no option $pick"
+      n=1
+      for row in "${AGENTS[@]}"; do
+        if [ "$n" -eq "$pick" ]; then break; fi
+        n=$((n + 1))
+      done
+      ;;
+    *)
+      pick="$(printf '%s' "$pick" | tr '[:upper:]' '[:lower:]')"
+      row="$(agent_row "$pick")" || die "unknown provider '$pick' (try: claude, codex, gemini, opencode, amp, goose, aider)"
+      ;;
+  esac
+  IFS='|' read -r name bin inst auth <<EOF
+$row
+EOF
+
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    bad "$name is not installed."
+    info "install: $inst"
+    info "auth:    $auth"
+    info "then rerun: samepage bootstrap $name"
+    exit 1
+  fi
+
+  info "if you haven't authenticated $name yet: $auth"
+  bold "Handing over to $name with the bootstrap prompt..."
+  case "$name" in
+    claude) exec claude "$(cat .samepage/BOOTSTRAP.md)" ;;
+    codex)  exec codex "$(cat .samepage/BOOTSTRAP.md)" ;;
+    gemini) exec gemini -i "$(cat .samepage/BOOTSTRAP.md)" ;;
+    *)
+      if command -v pbcopy >/dev/null 2>&1; then
+        pbcopy < .samepage/BOOTSTRAP.md
+        ok "bootstrap prompt copied to your clipboard — start '$bin' and paste it"
+      else
+        info "start '$bin' and paste the contents of .samepage/BOOTSTRAP.md"
+      fi
+      ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+samepage $VERSION — one shared context layer for every coding agent
+
+usage: samepage <command>
+
+  init [dir]            create the shared layer (AGENTS.md, .samepage/) and link agents to it
+  bootstrap [provider]  hand the setup of all other agents to the one you trust
+  doctor                show which agents are installed and whether the layer is intact
+  sync                  (re)create the symlinks after cloning or adding agents
+  version               print version
+EOF
+}
+
+case "${1:-help}" in
+  init)      shift; cmd_init "$@" ;;
+  bootstrap) shift; cmd_bootstrap "$@" ;;
+  doctor)    shift; cmd_doctor "$@" ;;
+  sync)      shift; cmd_sync "$@" ;;
+  version|-v|--version) printf 'samepage %s\n' "$VERSION" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

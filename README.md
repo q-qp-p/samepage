@@ -25,10 +25,22 @@ samepage is a small fix for both:
    calling it done. If you're in tmux or cmux, it offers to open one pane per
    agent.
 
+## Requirements
+
+- macOS or Linux (Windows via WSL), any terminal — cmux/tmux are optional;
+  the bootstrap only offers panes if you're already inside one.
+- git.
+- **One** coding-agent CLI installed and authenticated — whichever provider
+  you trust. Everything else gets installed later, by that agent, with your
+  say-so.
+
+No server, no database, no background process. The shared layer is plain
+files in your repo.
+
 ## Quick start
 
 ```sh
-git clone https://github.com/YOURNAME/samepage
+git clone https://github.com/shreyasnivas/samepage
 ln -s "$PWD/samepage/bin/samepage" ~/.local/bin/samepage   # or anywhere on your PATH
 
 cd your-project

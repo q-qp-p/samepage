@@ -5,8 +5,11 @@ set -euo pipefail
 
 VERSION="0.1.0"
 
-realpath_py() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
-SCRIPT_PATH="$(realpath_py "${BASH_SOURCE[0]}")"
+resolve_path() {
+  readlink -f "$1" 2>/dev/null ||
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+SCRIPT_PATH="$(resolve_path "${BASH_SOURCE[0]}")"
 ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
 TEMPLATES="$ROOT/templates"
 

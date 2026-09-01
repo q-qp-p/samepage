@@ -8,6 +8,8 @@
 
 3.shared context, memory, skills etc.
  
+<img width="1920" height="1080" alt="Screenshot 2026-09-02 at 1 03 27 AM" src="https://github.com/user-attachments/assets/f2f22424-40eb-41b4-8234-cebd676390dd" />
+
 
 ## Overview
 - **One shared layer per project.** `AGENTS.md` is the single source of

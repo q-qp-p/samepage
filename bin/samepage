@@ -1,210 +1,3170 @@
 #!/usr/bin/env bash
-# samepage — one shared context layer for every coding agent,
-# bootstrapped by the one you trust.
+# samepage: shared brain + pane bootstrap for cmux
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
-resolve_path() {
-  readlink -f "$1" 2>/dev/null ||
-    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_here() {
+  local src="${BASH_SOURCE[0]}"
+  while [ -L "$src" ]; do
+    local dir
+    dir="$(cd "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in
+      /*) ;;
+      *) src="$dir/$src" ;;
+    esac
+  done
+  cd "$(dirname "$src")" && pwd
 }
-SCRIPT_PATH="$(resolve_path "${BASH_SOURCE[0]}")"
-ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
-TEMPLATES="$ROOT/templates"
 
-bold() { printf '\033[1m%s\033[0m\n' "$*"; }
-info() { printf '  %s\n' "$*"; }
-warn() { printf '\033[33m! %s\033[0m\n' "$*"; }
-ok()   { printf '\033[32m+ %s\033[0m\n' "$*"; }
-bad()  { printf '\033[31mx %s\033[0m\n' "$*"; }
-die()  { bad "$*"; exit 1; }
+BIN_DIR="$(_here)"
+KIT_ROOT="${SAMEPAGE_ROOT:-$(cd "$BIN_DIR/.." && pwd)}"
+if [ ! -d "$KIT_ROOT/templates" ]; then
+  if [ -d "${HOME}/.local/share/samepage/templates" ]; then
+    KIT_ROOT="${HOME}/.local/share/samepage"
+  fi
+fi
 
-# name|binary|install hint|auth hint
-# Hints are best-effort and may drift; the bootstrap agent verifies against
-# each provider's docs at setup time (that's the whole design).
-AGENTS=(
-  "claude|claude|npm install -g @anthropic-ai/claude-code|run 'claude' once and follow the login prompt"
-  "codex|codex|npm install -g @openai/codex|codex login"
-  "gemini|gemini|npm install -g @google/gemini-cli|run 'gemini' once and pick a login method"
-  "opencode|opencode|brew install sst/tap/opencode|opencode auth login"
-  "amp|amp|npm install -g @sourcegraph/amp|run 'amp' once and follow the login prompt"
-  "goose|goose|brew install block-goose-cli|goose configure"
-  "aider|aider|python -m pip install aider-install && aider-install|export your provider API key"
-)
+KNOWN_PROVIDERS="claude codex grok gemini opencode antigravity"
 
-agent_row() { # $1 = name -> echoes matching row, or fails
-  local row
-  for row in "${AGENTS[@]}"; do
-    case "$row" in "$1|"*) printf '%s\n' "$row"; return 0 ;; esac
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+die() { printf 'samepage: %s\n' "$*" >&2; exit 1; }
+info() { printf 'samepage: %s\n' "$*" >&2; }
+warn() { printf 'samepage: warning: %s\n' "$*" >&2; }
+
+iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+human_now() { date -u +"%Y-%m-%d %H:%M"; }
+
+# An ISO stamp N minutes old, to compare against the ones in the roster. The two
+# date CLIs disagree about relative time (BSD takes -v, GNU takes -d) and both
+# are normal on the machines this runs on, so try each and fall back to python3,
+# which is a dependency already. The stamps are fixed-width UTC, so a plain
+# string comparison orders them and nothing downstream has to parse a date.
+iso_ago() {
+  local mins="$1" out
+  out="$(date -u -v-"${mins}"M +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  out="$(date -u -d "$mins minutes ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  python3 -c 'import datetime, sys
+d = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=int(sys.argv[1]))
+print(d.strftime("%Y-%m-%dT%H:%M:%SZ"))' "$mins"
+}
+
+# ASK THE FLAVOUR ONCE, BECAUSE THE WRONG ONE ANSWERS ANYWAY. GNU stat reads -f
+# as --file-system and returns the MOUNT POINT for %m, exit code 0, so a naive
+# `stat -f %m file || stat -c %Y file` chain never reaches its fallback and
+# every mtime comes back as "/". Probe with the GNU form, which BSD refuses
+# outright, and remember which one this machine speaks.
+STAT_MTIME_FLAVOUR=""
+file_mtime() {
+  [ -e "$1" ] || { printf '0\n'; return 0; }
+  if [ -z "$STAT_MTIME_FLAVOUR" ]; then
+    if stat -c %Y "$1" >/dev/null 2>&1; then
+      STAT_MTIME_FLAVOUR=gnu
+    else
+      STAT_MTIME_FLAVOUR=bsd
+    fi
+  fi
+  if [ "$STAT_MTIME_FLAVOUR" = gnu ]; then
+    stat -c %Y "$1" 2>/dev/null || printf '0\n'
+  else
+    stat -f %m "$1" 2>/dev/null || printf '0\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Project / brain
+# ---------------------------------------------------------------------------
+
+PROJECT="${SAMEPAGE_PROJECT:-}"
+DRY_RUN=0
+LEAD_AS=""
+SPAWN=auto
+WAIT_SECS="${SAMEPAGE_WAIT:-1}"
+SERVERS_FILE=""
+NAME_WIDTH=12
+VAR_WIDTH=20
+# Every server this run could not project, so the exit code can say so. A
+# scripted caller that reads only the status used to see success while a
+# harness had quietly lost a server.
+SYNC_FAILURES=0
+SEEN_PIDS=""
+JQ_PRESENT=0
+LAST_BACKUP=""
+# Every pane this run could not open, one "provider: reason" per line. A spawn
+# that could not proceed used to `die`, which exits the process, so a crash in
+# the LAST step of init took the report of everything already written down with
+# it. Collected here, reported at the end, and carried by the exit code instead.
+SPAWN_FAILURES=""
+
+# ONE BOARD ACROSS EVERY CHECKOUT.
+#
+# A linked worktree is the same project as its main checkout: the same repo, the
+# same people, the same work. A brain per worktree gave each one its own roster,
+# its own notes and its own shared log, so two panes on two branches of one repo
+# could not see each other at all. --git-common-dir points at the primary .git
+# from every linked worktree, and its parent is the main checkout. Outside a
+# repository there is nothing to derive from, so the project directory stands.
+MAIN_CHECKOUT_CACHE=""
+MAIN_CHECKOUT_FOR=""
+main_checkout() {
+  local base
+  if [ -n "$MAIN_CHECKOUT_FOR" ] && [ "$MAIN_CHECKOUT_FOR" = "$PROJECT" ]; then
+    printf '%s\n' "$MAIN_CHECKOUT_CACHE"
+    return 0
+  fi
+  base="$(git -C "$PROJECT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [ -n "$base" ]; then
+    base="$(dirname "$base")"
+  else
+    base="$PROJECT"
+  fi
+  MAIN_CHECKOUT_FOR="$PROJECT"
+  MAIN_CHECKOUT_CACHE="$base"
+  printf '%s\n' "$base"
+}
+
+brain_dir() { printf '%s\n' "$(main_checkout)/.samepage"; }
+
+# THE ESTATE THIS PROJECT ALREADY HAS, rather than a new empty file beside it.
+# Claude Code keeps a per-project memory estate outside the repo, at a path
+# derived from the project directory (every slash becomes a dash). It is the
+# real memory: hundreds of one-fact files plus a curated MEMORY.md index. A
+# second, empty MEMORY.md in .samepage/ would be the third such log in this
+# repo and the second one nobody ever wrote to, so samepage LINKS to the
+# estate instead of duplicating it.
+claude_estate() {
+  local base slug
+  # An explicit override wins: some estates live elsewhere, and it is the seam
+  # that makes the worktree behaviour below testable without a real home dir.
+  if [ -n "${SAMEPAGE_ESTATE:-}" ]; then
+    printf '%s\n' "$SAMEPAGE_ESTATE"
+    return 0
+  fi
+  # WORKTREES SHARE ONE ESTATE. The path is derived from the project directory,
+  # so a session in .worktrees/foo would derive a slug that has never existed
+  # and silently get no memory at all. Every worktree of a repo belongs to the
+  # same project, so derive from the MAIN checkout, which is the one place that
+  # answers the question the same way for every worktree of it.
+  base="$(main_checkout)"
+  slug="$(printf '%s' "$base" | tr '/' '-')"
+  printf '%s\n' "$HOME/.claude/projects/$slug/memory"
+}
+
+# WHERE EACH BRAIN LINK POINTS, in one place, because init and doctor have to
+# agree about it. When they did not, doctor told the founder to "run samepage
+# init" for a link init had deliberately skipped because there was nothing to
+# link to, which is advice that can never work.
+#   memory    the Claude memory estate for this project
+#   skills    the project's real skills, which stay real in .claude/skills
+#   artifacts the hosted pages' SOURCE mirror, kept beside the memory estate by
+#             convention, because the pages themselves live behind one vendor's
+#             login. It is the one of the three that often does not exist yet.
+link_source() {
+  local estate
+  estate="$(claude_estate)"
+  case "$1" in
+    memory) printf '%s\n' "$estate" ;;
+    skills) printf '%s\n' "$(main_checkout)/.claude/skills" ;;
+    artifacts) printf '%s\n' "$(dirname "$estate")/artifacts" ;;
+  esac
+}
+
+# Where OTHER agents append. The estate's MEMORY.md is a curated index with a
+# strict one-line-per-memory contract, so a foreign agent appending raw lines
+# would corrupt it. Everyone READS the estate; everyone WRITES here.
+shared_log() { printf '%s\n' "$(brain_dir)/SHARED.md"; }
+wip_dir() { printf '%s\n' "$(brain_dir)/wip"; }
+
+# One line, always. `rev-parse --abbrev-ref HEAD` prints "HEAD" AND fails on a
+# repo with no commits, so a naive `|| fallback` emits both and the wip path
+# ends up with a newline in it.
+pane_branch() {
+  local b
+  b="$(git -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null)" || b=""
+  [ -n "$b" ] || b="$(git -C "$1" rev-parse --short HEAD 2>/dev/null)" || b=""
+  [ -n "$b" ] || b="unborn"
+  printf '%s\n' "$b"
+}
+current_branch() { pane_branch "$PROJECT"; }
+# The note file for a branch, from anywhere. Every worktree's notes land in the
+# ONE wip directory at the main checkout, keyed by branch, which is what lets a
+# pane read what a pane on another branch is part-way through.
+branch_wip_path() {
+  printf '%s/%s.md\n' "$(wip_dir)" "$(printf '%s' "$1" | tr '/' '-')"
+}
+wip_path() { branch_wip_path "$(current_branch)"; }
+
+require_project() {
+  if [ -z "$PROJECT" ]; then
+    if git rev-parse --show-toplevel >/dev/null 2>&1; then
+      PROJECT="$(git rev-parse --show-toplevel)"
+    else
+      PROJECT="$(pwd)"
+    fi
+  fi
+  PROJECT="$(cd "$PROJECT" && pwd)"
+}
+
+require_brain() {
+  require_project
+  [ -d "$(brain_dir)" ] || die "no shared brain for $PROJECT yet (run: samepage)"
+  roster_migrate_if_stale
+}
+
+template() {
+  local name="$1"
+  local path="$KIT_ROOT/templates/$name"
+  [ -f "$path" ] || die "missing template $name (KIT_ROOT=$KIT_ROOT)"
+  printf '%s\n' "$path"
+}
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
+provider_bin() {
+  case "$1" in
+    claude) command -v claude 2>/dev/null || true ;;
+    codex) command -v codex 2>/dev/null || true ;;
+    grok) command -v grok 2>/dev/null || true ;;
+    gemini) command -v gemini 2>/dev/null || true ;;
+    opencode) command -v opencode 2>/dev/null || true ;;
+    antigravity) command -v agy 2>/dev/null || true ;;
+    *) printf '' ;;
+  esac
+}
+
+provider_launch() {
+  case "$1" in
+    claude|codex|grok|gemini|opencode) printf '%s\n' "$1" ;;
+    antigravity) printf 'agy\n' ;;
+    *) die "unknown provider: $1" ;;
+  esac
+}
+
+is_known_provider() {
+  local p="$1" x
+  for x in $KNOWN_PROVIDERS; do
+    [ "$x" = "$p" ] && return 0
   done
   return 1
 }
 
-link_one() { # $1 = link path, $2 = target (relative to link's directory)
-  if [ -L "$1" ]; then
-    ok "$1 -> $(readlink "$1") (already linked)"
-  elif [ -e "$1" ]; then
-    warn "$1 exists and is not a symlink — left untouched (merge its content into AGENTS.md, delete it, then rerun 'samepage sync')"
+detect_self() {
+  if [ -n "$LEAD_AS" ]; then
+    printf '%s\n' "$LEAD_AS"
+    return
+  fi
+  # THE PROCESS BEFORE THE ENVIRONMENT, and Antigravity before Gemini.
+  # Antigravity is Gemini underneath and exports Gemini's variables, so an
+  # env-first sniff files every Antigravity pane as "gemini". That is not a
+  # cosmetic mislabel: it is how one harness came to sit in the roster under
+  # another's name.
+  local parent
+  parent="$(ps -o comm= -p "$PPID" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  case "$parent" in
+    *agy*) printf 'antigravity\n'; return ;;
+  esac
+  if [ -n "${CLAUDECODE:-}" ] || [ -n "${CLAUDE_CODE:-}" ] || [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+    printf 'claude\n'
+    return
+  fi
+  if [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SESSION_ID:-}" ]; then
+    printf 'codex\n'
+    return
+  fi
+  if [ -n "${GROK_SESSION_ID:-}" ] || [ -n "${XAI_SESSION_ID:-}" ]; then
+    printf 'grok\n'
+    return
+  fi
+  if [ -n "${GEMINI_CLI:-}" ]; then
+    printf 'gemini\n'
+    return
+  fi
+  case "$parent" in
+    *claude*) printf 'claude\n' ;;
+    *codex*) printf 'codex\n' ;;
+    *grok*) printf 'grok\n' ;;
+    *gemini*) printf 'gemini\n' ;;
+    *opencode*) printf 'opencode\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+detected_providers() {
+  local p bin
+  for p in $KNOWN_PROVIDERS; do
+    bin="$(provider_bin "$p")"
+    [ -n "$bin" ] && printf '%s\n' "$p"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# cmux helpers
+# ---------------------------------------------------------------------------
+
+cmux_bin() { command -v cmux 2>/dev/null || true; }
+
+cmux_ok() {
+  [ -n "$(cmux_bin)" ] || return 1
+  cmux identify >/dev/null 2>&1
+}
+
+cmux_json_field() {
+  # stdin: json  $1: jq path
+  jq -r "$1 // empty" 2>/dev/null
+}
+
+cmux_caller_surface() {
+  cmux identify 2>/dev/null | cmux_json_field '.caller.surface_ref'
+}
+
+cmux_caller_pane() {
+  cmux identify 2>/dev/null | cmux_json_field '.caller.pane_ref'
+}
+
+cmux_caller_workspace() {
+  cmux identify 2>/dev/null | cmux_json_field '.caller.workspace_ref'
+}
+
+list_pane_ids() {
+  cmux list-panes 2>/dev/null | awk '{
+    for (i = 1; i <= NF; i++) if ($i ~ /^pane:[0-9]+$/) print $i
+  }'
+}
+
+list_surface_ids() {
+  cmux tree 2>/dev/null | awk '{
+    for (i = 1; i <= NF; i++) if ($i ~ /^surface:[0-9]+$/) print $i
+  }'
+}
+
+surface_in_pane() {
+  local pane="$1"
+  cmux list-pane-surfaces --pane "$pane" 2>/dev/null | awk '
+    /^\*/ { for (i = 1; i <= NF; i++) if ($i ~ /^surface:[0-9]+$/) { print $i; exit } }
+    { last = "" }
+    {
+      for (i = 1; i <= NF; i++) if ($i ~ /^surface:[0-9]+$/) last = $i
+    }
+    END { if (last != "") print last }
+  '
+}
+
+# ---------------------------------------------------------------------------
+# Roster / events
+# ---------------------------------------------------------------------------
+
+roster_path() { printf '%s\n' "$(brain_dir)/roster.tsv"; }
+events_path() { printf '%s\n' "$(brain_dir)/events.log"; }
+
+append_event() {
+  local kind="$1"
+  local who="$2"
+  local body="$3"
+  require_brain
+  if [ "$DRY_RUN" = 1 ]; then
+    info "dry-run event $kind $who $body"
+    return
+  fi
+  mkdir -p "$(brain_dir)"
+  printf '%s\t%s\t%s\t%s\n' "$(iso_now)" "$kind" "$who" "$body" >>"$(events_path)"
+}
+
+roster_header() {
+  printf 'name\tprovider\tsurface\tpane\tcwd\tbranch\tstarted\tlast_seen\tpulsed_at\n'
+}
+
+# THE ROSTER IS REGENERABLE, SO A FORMAT CHANGE IS A REBUILD, NOT A MIGRATION.
+# Every open pane writes its row again within seconds of the next command, and a
+# hand-written column migration is a second parser to keep true for a file that
+# is machine-local and never committed. The old board is kept as a backup so
+# nothing is destroyed, and a fresh one starts.
+ROSTER_CHECKED=0
+# A dry run may not rebuild the board, so it has to be able to say that the one
+# on disk cannot be read. Columns that have moved still parse: every row comes
+# back looking plausible with a timestamp where the branch should be, which is
+# the kind of wrong nobody checks.
+ROSTER_STALE=0
+roster_migrate_if_stale() {
+  [ "$ROSTER_CHECKED" = 1 ] && return 0
+  ROSTER_CHECKED=1
+  local path first want
+  path="$(roster_path)"
+  [ -f "$path" ] || return 0
+  first="$(head -n 1 "$path" 2>/dev/null || true)"
+  want="$(roster_header)"
+  [ "$first" = "$want" ] && return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    ROSTER_STALE=1
+    return 0
+  fi
+  mkdir -p "$(backups_dir)"
+  # A SECOND IS NOT UNIQUE. Two panes upgrading in the same second would have
+  # one overwrite the other's backup, which is the copy that exists so nothing
+  # is destroyed.
+  local dest stamp n=0
+  stamp="$(iso_now)"
+  dest="$(backups_dir)/roster.tsv.$stamp"
+  while [ -e "$dest" ]; do
+    n=$((n + 1))
+    dest="$(backups_dir)/roster.tsv.$stamp.$n"
+  done
+  write_or_die cp "$path" "$dest"
+  roster_header >"$path"
+  info "the roster format changed; the old board is in $(backups_dir) and a fresh one has started"
+}
+
+# Every live row, header dropped. One place, so the board, the digest and the
+# pulse all read the file the same way.
+# Only rows this version can read, WITH NO EMPTY COLUMN IN THEM. Two things are
+# going on here and both have bitten:
+#
+#   A row with fewer columns was written by an older samepage that is still
+#   running in some pane. prune_roster names it and drops it, and until then it
+#   must not reach a renderer that would print one field under another's
+#   heading.
+#
+#   And every reader below splits on tabs with `read`, where tab is IFS
+#   WHITESPACE: two adjacent tabs collapse into one and a leading tab is
+#   stripped, so ONE empty column silently shifts every value after it left by
+#   one. A row with no pane recorded rendered its cwd as its branch. The
+#   substitution happens here, once, rather than in each reader, because a
+#   reader that forgets it looks completely correct.
+roster_rows() {
+  local path
+  [ "$ROSTER_STALE" = 1 ] && return 0
+  path="$(roster_path)"
+  [ -f "$path" ] || return 0
+  awk -F '\t' -v OFS='\t' 'NR > 1 && NF >= 9 {
+    for (i = 1; i <= NF; i++) if ($i == "") $i = "-"
+    print
+  }' "$path"
+}
+
+roster_upsert() {
+  local name="$1" provider="$2" surface="$3" pane="$4" cwd="$5" branch="${6:-}"
+  require_brain
+  [ -n "$branch" ] || branch="$(current_branch)"
+  if [ "$DRY_RUN" = 1 ]; then
+    info "dry-run roster $name $provider $surface $pane $branch"
+    return
+  fi
+  local path tmp
+  path="$(roster_path)"
+  tmp="$(mktemp)"
+  if [ ! -f "$path" ]; then
+    roster_header >"$path"
+  fi
+  # A ROW IS A SURFACE, NOT A ROLE. This used to dedupe on the name column,
+  # and init hardcoded that name to "lead", so the second agent to run init
+  # deleted the first one's row while it was still running: two panes open,
+  # one line on the board, and the pane the founder was talking to gone from
+  # it. Two agents cannot share a cmux surface, so the surface is the identity.
+  # Outside cmux there is no surface, and the name is the best key left.
+  local key_col key
+  if [ -n "$surface" ] && [ "$surface" != "-" ]; then
+    key_col=3
+    key="$surface"
   else
-    ln -s "$2" "$1"
-    ok "$1 -> $2"
+    key_col=1
+    key="$name"
+  fi
+  # KEEP WHAT THE ROW ALREADY KNEW. started says when this pane joined and
+  # pulsed_at says when it was last messaged. Both are older than this write, and
+  # erasing pulsed_at on every re-registration would let the sonar message the
+  # same pane again the moment it primed, which is the noise this all exists to
+  # end.
+  local prior started pulsed
+  prior="$(awk -F '\t' -v col="$key_col" -v key="$key" 'NR > 1 && $col == key { print; exit }' "$path")"
+  started="$(printf '%s' "$prior" | awk -F '\t' '{ print $7 }')"
+  pulsed="$(printf '%s' "$prior" | awk -F '\t' '{ print $9 }')"
+  [ -n "$started" ] || started="$(iso_now)"
+  awk -F '\t' -v col="$key_col" -v key="$key" 'NR == 1 || $col != key' "$path" >"$tmp"
+  # A DASH, NEVER AN EMPTY COLUMN: see the note in sonar_pulse. Every reader of
+  # this file splits on tabs, and tab is IFS whitespace, so one empty column in
+  # the middle shifts every value after it under the wrong heading.
+  [ -n "$surface" ] || surface="-"
+  [ -n "$pane" ] || pane="-"
+  [ -n "$cwd" ] || cwd="-"
+  [ -n "$branch" ] || branch="-"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "$provider" "$surface" "$pane" "$cwd" "$branch" "$started" "$(iso_now)" "$pulsed" >>"$tmp"
+  write_or_die mv "$tmp" "$path"
+}
+
+# WHEN A PANE WAS LAST MESSAGED, which is the whole of the no-noise guarantee.
+# The sonar reads it before it sends and writes it after, so a pane cannot be
+# reached twice inside the window however many times the command is run.
+roster_mark_pulsed() {
+  local key="$1" path tmp
+  [ "$DRY_RUN" = 1 ] && return 0
+  path="$(roster_path)"
+  [ -f "$path" ] || return 0
+  tmp="$(mktemp)"
+  awk -F '\t' -v OFS='\t' -v key="$key" -v now="$(iso_now)" '
+    NR == 1 { print; next }
+    ($1 == key || $3 == key) { $9 = now }
+    { print }
+  ' "$path" >"$tmp"
+  write_or_die mv "$tmp" "$path"
+}
+
+roster_pulsed_at() {
+  local path
+  path="$(roster_path)"
+  [ -f "$path" ] || return 0
+  awk -F '\t' -v key="$1" 'NR > 1 && ($1 == key || $3 == key) { print $9; exit }' "$path"
+}
+
+roster_get() {
+  local key="$1"  # name or provider
+  local path
+  path="$(roster_path)"
+  [ -f "$path" ] || return 1
+  awk -F '\t' -v k="$key" 'NR > 1 && ($1 == k || $2 == k) { print; exit }' "$path"
+}
+
+roster_surface_for() {
+  local row
+  row="$(roster_get "$1" || true)"
+  [ -n "$row" ] || return 1
+  printf '%s\n' "$row" | awk -F '\t' '{ print $3 }'
+}
+
+# A CLOSED PANE IS NOT A PEER. The board's only job is to say who is here, and
+# a row for a pane that no longer exists is the same lie as a missing row for
+# one that does: it was a board full of ghosts, plus the pane the founder was
+# actually typing into absent from it, that made the thing untrustworthy in the
+# first place. Rows with no surface belong to harnesses outside cmux and are
+# never pruned, and neither is anything if cmux cannot be asked.
+prune_roster() {
+  local path live tmp cutoff
+  path="$(roster_path)"
+  [ -f "$path" ] || return 0
+  # A pane that has not run a samepage command for a day is archaeology rather
+  # than a board: it has no note anyone is waiting on, and inside cmux it has
+  # usually closed. last_seen is written on every command by this version, so it
+  # is the stamp that answers the question; a row missing it at all is handled
+  # as an older samepage's, below.
+  cutoff="$(iso_ago 1440)"
+  # AN OLDER PANE IS A FACT, NOT A CORRUPTION. During an upgrade window a 0.1.0
+  # pane keeps appending six-column rows to a nine-column board. Dropping them
+  # in silence loses the pane from the board with nothing said, and the founder
+  # sees a colleague vanish; so each one is named once, with the fix.
+  # AND A PADDED ROW IS STILL AN OLD ROW. roster_mark_pulsed assigns $9, which
+  # makes awk rebuild the record with nine fields, so a six-column row that has
+  # been pulsed once passes a column count and then fails the timestamp checks
+  # below and disappears with nothing said. What gives it away is that the two
+  # stamps this version always writes are empty.
+  local short provider surface
+  short="$(awk -F '\t' 'NR > 1 && NF > 0 &&
+    (NF < 9 || $7 == "" || $7 == "-" || $8 == "" || $8 == "-") {
+    printf "%s\t%s\n", ($2 == "" ? "unknown" : $2), ($3 == "" ? "-" : $3)
+  }' "$path")"
+  if [ -n "$short" ]; then
+    while IFS="	" read -r provider surface; do
+      [ -n "$provider" ] || continue
+      info "an older samepage wrote to the board ($provider, $surface); upgrade that pane with tools/samepage/install.sh"
+    done <<EOF_SHORT
+$short
+EOF_SHORT
+  fi
+  tmp="$(mktemp)"
+  awk -F '\t' -v cutoff="$cutoff" '
+    NR == 1 { print; next }
+    NF < 9 { next }
+    ($7 == "" || $7 == "-" || $8 == "" || $8 == "-") { next }
+    ($8 >= cutoff) { print }
+  ' "$path" >"$tmp"
+  write_or_die mv "$tmp" "$path"
+  cmux_ok || return 0
+  # Space separated, because awk -v cannot carry a newline.
+  live="$(list_surface_ids | tr '\n' ' ')"
+  [ -n "${live// /}" ] || return 0
+  tmp="$(mktemp)"
+  awk -F '\t' -v live="$live" '
+    BEGIN { n = split(live, a, " "); for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1 }
+    NR == 1 { print; next }
+    $3 == "" || $3 == "-" { print; next }
+    ($3 in ok) { print }
+  ' "$path" >"$tmp"
+  write_or_die mv "$tmp" "$path"
+}
+
+write_status() {
+  require_brain
+  [ "$DRY_RUN" = 1 ] && return
+  prune_roster
+  local path roster
+  path="$(brain_dir)/STATUS.md"
+  roster="$(roster_path)"
+  {
+    printf '# Status\n\nGenerated %s by samepage %s.\n\n' "$(iso_now)" "$VERSION"
+    if [ -f "$roster" ]; then
+      printf '## Panes\n\n'
+      printf '| name | provider | surface | pane | branch | last seen | pulsed |\n'
+      printf '|---|---|---|---|---|---|---|\n'
+      awk -F '\t' 'NR > 1 {
+        printf "| %s | %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $6, $8, ($9 == "" ? "-" : $9)
+      }' "$roster"
+      printf '\n'
+    else
+      printf 'No panes registered yet.\n\n'
+    fi
+    if [ -f "$(shared_log)" ]; then
+      printf '## Shared log (newest)\n\n'
+      tail -n 8 "$(shared_log)" | grep -v '^#' | grep -v '^$' || true
+      printf '\n'
+    fi
+  } >"$path"
+}
+
+# ---------------------------------------------------------------------------
+# Inject AGENTS.md / CLAUDE.md blocks
+# ---------------------------------------------------------------------------
+
+# EVERY TRACKED FILE THIS VERB REWRITES SAYS SO.
+#
+# init refreshes the project skill and the constitution block from the kit on
+# every run, so a newer kit rewrites files the repo tracks under the founder's
+# feet. In silence that reads as a mystery dirty tree, and the first move a
+# surprised founder makes is to revert it, which puts the stale copies straight
+# back (it happened on 2026-09-01, to two files, both reverted). A
+# byte-identical write is not a refresh and says nothing.
+#
+# The protocol is not routed through here, because init stopped rewriting it at
+# all: a file the project may edit is written once and then left alone. Silence
+# is honest for that one because nothing happened to it.
+refresh_tracked() {
+  local src="$1" dest="$2"
+  if [ "$DRY_RUN" = 1 ]; then
+    info "dry-run refresh $(project_relative "$dest")"
+    return 0
+  fi
+  if [ -f "$dest" ]; then
+    if cmp -s "$src" "$dest"; then
+      return 0
+    fi
+    mkdir -p "$(dirname "$dest")"
+    cp "$src" "$dest"
+    info "refreshed $(project_relative "$dest") from the kit template; review and commit"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  cp "$src" "$dest"
+  info "wrote $(project_relative "$dest") from the kit template"
+}
+
+# Paths read better against the project they are in than as absolute ones, and
+# the founder is about to look for them in a git status.
+project_relative() {
+  local rel="$1" home
+  home="$(main_checkout)"
+  rel="${rel#"$home"/}"
+  printf '%s\n' "${rel#"$PROJECT"/}"
+}
+
+inject_block() {
+  local target="$1"
+  local block_file="$2"
+  if [ "$DRY_RUN" = 1 ]; then
+    info "dry-run inject $block_file -> $target"
+    return
+  fi
+  local changed
+  changed="$(python3 - "$target" "$block_file" <<'PY'
+import pathlib, sys
+target = pathlib.Path(sys.argv[1])
+block = pathlib.Path(sys.argv[2]).read_text()
+if not block.endswith("\n"):
+    block += "\n"
+start = "<!-- samepage:start -->"
+end = "<!-- samepage:end -->"
+text = target.read_text() if target.exists() else ""
+if start in text and end in text:
+    pre = text.split(start, 1)[0]
+    post = text.split(end, 1)[1]
+    if post.startswith("\n"):
+        post = post[1:]
+    new = pre.rstrip() + "\n\n" + block + ("\n" + post.lstrip("\n") if post.strip() else "")
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    new = (text + ("\n" if text.strip() else "") + block)
+if new == text:
+    # Nothing to say: the block the kit ships is already the block on disk.
+    sys.exit(0)
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_text(new)
+print("changed")
+PY
+)"
+  if [ -n "$changed" ]; then
+    info "updated the samepage block in $(project_relative "$target"); review and commit"
   fi
 }
 
-link_agents() {
-  link_one CLAUDE.md AGENTS.md
-  link_one GEMINI.md AGENTS.md
-  mkdir -p .claude
-  link_one .claude/skills ../.samepage/skills
-  if command -v ruler >/dev/null 2>&1; then
-    info "ruler detected — 'ruler apply' can cover agents samepage doesn't link natively"
+# EVERY MACHINE-LOCAL PATH THE BRAIN OWNS, IN ONE PLACE. init used to be the
+# only verb that ignored them, so a brain created by anything else left the
+# roster, the notes and the signature file staged for the founder's next commit.
+# It is a no-op when nothing is missing, which is what makes it safe to run on
+# every sonar.
+ensure_brain_ignored() {
+  [ "$DRY_RUN" = 1 ] && return 0
+  ensure_ignored \
+    "/.samepage/memory" \
+    "/.samepage/skills" \
+    "/.samepage/artifacts" \
+    "/.samepage/backups/" \
+    "/.samepage/wip/" \
+    "/.samepage/roster.tsv" \
+    "/.samepage/events.log" \
+    "/.samepage/STATUS.md" \
+    "/.samepage/sync.sig"
+}
+
+# Append any missing paths to the project .gitignore, once, under one header.
+# The board lives at the main checkout, so the entries that keep it out of git
+# belong to the main checkout's ignore file. A worktree's own copy is the same
+# tracked file anyway; writing there from a worktree would make a dirty tree in
+# the one place a founder is least expecting one.
+ensure_ignored() {
+  local gi="$(main_checkout)/.gitignore" line
+  [ -f "$gi" ] || : >"$gi"
+  for line in "$@"; do
+    grep -qxF "$line" "$gi" 2>/dev/null && continue
+    if ! grep -qxF "# samepage (machine-local, never committed)" "$gi" 2>/dev/null; then
+      printf '\n# samepage (machine-local, never committed)\n' >>"$gi"
+    fi
+    printf '%s\n' "$line" >>"$gi"
+  done
+}
+
+# ONE REAL FILE, THE REST ARE LINKS TO IT.
+#
+# Every harness looks for skills in its own directory (.claude, .codex, .grok,
+# and the cross-vendor .agents), so the skill has to be findable in four
+# places. It must not EXIST in four places: four copies of one file drift, and
+# the copy nobody edits is the one that keeps the bug. The canonical copy lives
+# under .claude/skills because that is where this repo's skills are real; the
+# others are symlinks to it, which is the same mechanism .samepage/skills uses.
+install_project_skill() {
+  local dest="$1"
+  [ "$DRY_RUN" = 1 ] && return
+  mkdir -p "$dest"
+  refresh_tracked "$KIT_ROOT/skills/samepage/SKILL.md" "$dest/SKILL.md"
+}
+
+link_project_skill() {
+  local dest="$1" canonical="$2" rel
+  [ "$DRY_RUN" = 1 ] && return
+  [ -d "$canonical" ] || return 0
+  mkdir -p "$(dirname "$dest")"
+  if [ -L "$dest" ] || [ -e "$dest" ]; then
+    # A previous version copied instead of linking. Replace the copy so there
+    # is exactly one file again, but never touch the canonical one.
+    [ "$dest" -ef "$canonical" ] && return 0
+    rm -rf "$dest"
+  fi
+  rel="$(relative_to "$(dirname "$dest")" "$canonical")"
+  ln -s "$rel" "$dest"
+}
+
+# A relative link, so the tree still resolves after a clone or a move.
+relative_to() {
+  python3 -c 'import os,sys; print(os.path.relpath(sys.argv[2], sys.argv[1]))' "$1" "$2"
+}
+
+# ---------------------------------------------------------------------------
+# Connections
+# ---------------------------------------------------------------------------
+#
+# TWO LAWS, and everything below is their consequence.
+#
+# 1. THE PRIMARY HARNESS'S CONFIG IS THE DECLARATION. There is no samepage
+#    connections file, because a new file to author is a second answer to
+#    "which servers do I have", and the copy nobody edits is the one that gets
+#    believed. You add a server to the model you already trust, the way its own
+#    docs tell you to, and sync projects it outward.
+#
+# 2. NO SECRET VALUE IS EVER WRITTEN ANYWHERE. Codex gets the NAME of an
+#    environment variable, Gemini gets the literal string "$VAR" that it expands
+#    at read time, and the shell profile gets a line that DERIVES the token from
+#    the primary config at run time. The one real copy stays where the founder
+#    already put it. Rotate it there and every harness follows; nothing else has
+#    to be re-synced, and nothing else can leak.
+#
+# Both were the hand procedure first (afterlaunch and resend, projected by hand
+# into Codex and Gemini on 2026-08-31). This verb is that procedure, written
+# down.
+
+claude_config() { printf '%s\n' "${SAMEPAGE_CLAUDE_CONFIG:-$HOME/.claude.json}"; }
+claude_settings() { printf '%s\n' "${SAMEPAGE_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"; }
+codex_bin() { printf '%s\n' "${SAMEPAGE_CODEX_BIN:-codex}"; }
+# Overridable so the test suite can point at an isolated tmux server (`-L`).
+# Without this seam, running the suite would enumerate, and send text into, the
+# user's own live tmux panes.
+tmux_bin() { printf '%s\n' "${SAMEPAGE_TMUX_BIN:-tmux}"; }
+have_tmux() { command -v "$(tmux_bin)" >/dev/null 2>&1; }
+codex_config() { printf '%s\n' "${SAMEPAGE_CODEX_CONFIG:-$HOME/.codex/config.toml}"; }
+gemini_bin() { printf '%s\n' "${SAMEPAGE_GEMINI_BIN:-gemini}"; }
+gemini_settings() { printf '%s\n' "${SAMEPAGE_GEMINI_SETTINGS:-$HOME/.gemini/settings.json}"; }
+shell_profile() { printf '%s\n' "${SAMEPAGE_PROFILE:-$HOME/.zshrc}"; }
+
+# ONE filter, three call sites: the profile line sync writes, the in-process
+# export VERIFY runs on, and doctor. They drifted before. Two used ."$name" and
+# the written line used a bare .$name, so a hyphenated server (afterlaunch-proto)
+# derived EMPTY from the profile forever while VERIFY and doctor both called it
+# healthy, because they were reading with the form that worked. The name goes in
+# as --arg DATA, so the program text is fixed and a name is never part of it.
+JQ_AUTH_FILTER='.. | objects | .mcpServers? // empty | .[$n]? // empty | .headers.Authorization // empty'
+
+# $1 server name, $2 config path. Prints the bearer token, or nothing at all.
+derive_auth() {
+  jq -r --arg n "$1" "$JQ_AUTH_FILTER" "$2" 2>/dev/null | head -1 | sed 's/^Bearer //'
+}
+
+backups_dir() { printf '%s\n' "$(brain_dir)/backups"; }
+
+# A BRAIN THAT CANNOT BE WRITTEN IS NOT A SLOWER BRAIN, IT IS A SILENT ONE.
+# Every board write is a mv or a cp onto a path the founder may have made
+# read-only, or that lives on a full disk. Under set -e that ends the run with
+# no message at all, which reads as the tool doing nothing for no reason.
+write_or_die() {
+  # The tool's own sentence, not the tool's sentence under `mv: rename ...`.
+  # The raw line names a temp file the founder has never heard of and cannot
+  # act on, and it arrives first, so it is the one that gets read.
+  "$@" 2>/dev/null || die "cannot write the brain at $(brain_dir) (permission denied)"
+}
+
+# A copy before the FIRST write of a run to each target, so a bad projection is
+# one `cp` from undone. Note which files can appear here: only ones we write,
+# which is why the primary config is not among them. We never write to it, so
+# it is never backed up, so no backup can carry the token.
+BACKED_UP=""
+# LAST_BACKUP is the copy this call made, or empty if there was nothing to copy.
+# A rollback that fails has to be able to name the file the founder restores by
+# hand, and "check the backups directory" is not a name.
+backup_target() {
+  local file="$1" base stamp
+  LAST_BACKUP=""
+  case " $BACKED_UP " in
+    *" $file "*) return 0 ;;
+  esac
+  BACKED_UP="$BACKED_UP $file"
+  [ "$DRY_RUN" = 1 ] && return 0
+  [ -f "$file" ] || return 0
+  mkdir -p "$(backups_dir)"
+  base="$(basename "$file")"
+  stamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+  cp "$file" "$(backups_dir)/$base.$stamp"
+  LAST_BACKUP="$(backups_dir)/$base.$stamp"
+}
+
+# The whole document, because mcpServers is not in one place. Claude keeps a
+# global block AND a block per project section, so a walk that reads only the
+# top level silently misses the servers the founder added while inside a repo.
+# A name declared twice is taken FIRST-SEEN in a depth-first walk. The top-level
+# block is read before the walk descends anywhere else, so the standing global
+# declaration beats a repo-local override of the same name, which is the case
+# that matters: projecting the override would push a repo-specific url onto
+# every other harness. Between two nested blocks, document order decides. There
+# is no depth ranking in this walk, so do not read one into it.
+#
+# A SERVER NAME IS DATA, NEVER SHELL. On 2026-09-01 a QA pass registered a
+# server called  x' ; touch /tmp/PWNED ; : '  and watched the generated profile
+# line close its quote and run the payload at every shell start. So the charset
+# is validated HERE, at the one place every projection reads from, and a name
+# outside it is refused rather than passed on. Everything downstream also hands
+# the name to jq as --arg data, so even an allowed name is never program text.
+claude_servers() {
+  local cfg
+  cfg="$(claude_config)"
+  [ -f "$cfg" ] || return 0
+  python3 - "$cfg" <<'PY'
+import json, pathlib, re, sys
+
+try:
+    raw = pathlib.Path(sys.argv[1]).read_text()
+except OSError:
+    sys.exit(4)
+try:
+    doc = json.loads(raw or "{}")
+except ValueError:
+    # Exit 3 means "the file exists and is not JSON", which the caller reports
+    # differently from "valid JSON that declares no servers".
+    sys.exit(3)
+
+found = {}
+
+
+def walk(node):
+    if isinstance(node, dict):
+        block = node.get("mcpServers")
+        if isinstance(block, dict):
+            for name, cfg in block.items():
+                if isinstance(cfg, dict) and name not in found:
+                    found[name] = cfg
+        for key, value in node.items():
+            if key != "mcpServers":
+                walk(value)
+    elif isinstance(node, list):
+        for item in node:
+            walk(item)
+
+
+walk(doc)
+
+# fullmatch, never match against ^...$: Python's `$` also matches just before a
+# trailing newline, so `afterlaunch\n` would pass ^[A-Za-z0-9_.-]+$ and slip the
+# refusal, corrupting the gemini projector while sync still reported success (QA
+# 2026-09-01). fullmatch anchors to the true end of the string and refuses it.
+SAFE_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+
+for name, cfg in found.items():
+    url = cfg.get("url") or cfg.get("httpUrl") or ""
+    if not SAFE_NAME.fullmatch(name):
+        # Refused, and stripped of anything that would break the TSV or the
+        # report line it is about to appear in. Nothing downstream uses this
+        # string for more than saying why the server went no further.
+        print("\t".join((re.sub(r"[^ -~]", "?", name)[:60], "refused", "", "")))
+        continue
+    if url:
+        kind = "http"
+    elif cfg.get("command"):
+        kind = "stdio"
+    else:
+        # Neither a url nor a command: not a server this verb can project, and
+        # calling it stdio would send the founder off to project it by hand.
+        kind = "none"
+    var = ""
+    if kind == "http":
+        auth = (cfg.get("headers") or {}).get("Authorization") or ""
+        if isinstance(auth, str) and auth.startswith("Bearer "):
+            # afterlaunch -> AFTERLAUNCH_API_KEY. The founder's profile already
+            # exports that exact name, so the derivation has to agree with it
+            # or sync would append a duplicate beside a working one.
+            var = re.sub(r"[^A-Za-z0-9]", "_", name).upper() + "_API_KEY"
+    print("\t".join((name, kind, url, var)))
+PY
+}
+
+# name<TAB>url<TAB>bearer-token-env-var for what Codex already holds.
+codex_list_tsv() {
+  local bin="$1" out
+  out="$("$bin" mcp list --json 2>/dev/null </dev/null || true)"
+  [ -n "$out" ] || return 0
+  printf '%s' "$out" | python3 -c '
+import json, sys
+
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for row in rows if isinstance(rows, list) else []:
+    transport = row.get("transport") or {}
+    print("\t".join((
+        row.get("name") or "",
+        transport.get("url") or "",
+        transport.get("bearer_token_env_var") or "",
+    )))
+'
+}
+
+# Why a server went no further, in the founder's words. A refusal is the
+# security boundary of claude_servers and counts as a failure; the two skips are
+# shapes this verb cannot project and are not failures.
+STDIO_SKIP_REASON="skipped (stdio; project it by hand if you need it)"
+NO_URL_SKIP_REASON="skipped (no url; not an http server)"
+REFUSED_REASON="refused (unsafe name: only letters, digits, dot, dash, underscore)"
+
+skip_reason() {
+  case "$1" in
+    stdio) printf '%s\n' "$STDIO_SKIP_REASON" ;;
+    refused) printf '%s\n' "$REFUSED_REASON" ;;
+    *) printf '%s\n' "$NO_URL_SKIP_REASON" ;;
+  esac
+}
+
+note_failure() { SYNC_FAILURES=$((SYNC_FAILURES + 1)); }
+
+# One report line, indented and padded to the widest server name in this run so
+# the harnesses line up in one column. NAME_WIDTH is sized by cmd_sync before any
+# harness runs. Single-sourced here so the padding cannot drift between harnesses.
+report_line() {
+  printf "    %-${NAME_WIDTH}s %s\n" "$1" "$2"
+}
+
+# A server present in a target that the primary config no longer declares. Only
+# ever reported: sync owns what it projects, and deleting a server a founder
+# added inside codex by hand is not a projection, it is a guess.
+orphan_line() {
+  report_line "$1" "orphan (still in $2; primary no longer declares it)"
+}
+
+# THE ONE PLACE A PROJECTION BECOMES A REPORT LINE, so codex and gemini give the
+# SAME words for the same outcome (a stdio skip, a dry-run add, an orphan) and
+# cannot drift into two vocabularies. Each harness plans its servers into a
+# normalised status stream, one `status<TAB>name<TAB>detail` per line, its own
+# way: codex by probing the CLI and writing row by row, gemini by a single
+# settings upsert in python. The skip vocabulary, the dry-run wording, the orphan
+# line and the failure count all live here, once. $1 names the harness for the
+# orphan line.
+#
+# READ FROM A FILE OR HEREDOC, NEVER THE RIGHT-HAND SIDE OF A PIPE. note_failure
+# increments a script global, and a pipe would run this loop in a subshell where
+# that increment is lost and a failed projection would exit 0. This is exactly
+# why the two callers below capture their plan first and feed it in by
+# redirection.
+report_projection() {
+  local harness="$1" status name detail
+  while IFS=$'\t' read -r status name detail; do
+    [ -n "$status" ] || continue
+    case "$status" in
+      stdio|none|refused)
+        report_line "$name" "$(skip_reason "$status")"
+        if [ "$status" = refused ]; then note_failure; fi
+        ;;
+      unchanged) report_line "$name" unchanged ;;
+      added|updated)
+        if [ "$DRY_RUN" = 1 ]; then
+          report_line "$name" "$status (dry-run)"
+        else
+          report_line "$name" "$status"
+        fi
+        ;;
+      orphan) orphan_line "$name" "$harness" ;;
+      # Nothing reached the harness at all, which is a failed projection and not a
+      # quiet note at the foot of a report that otherwise reads as a success.
+      unreadable) printf '    %s\n' "$name"; note_failure ;;
+      # A harness-specific failure line, carried through verbatim. `fail` counts
+      # against the exit code; `line` is a continuation (codex's restore-by-hand
+      # note) that must not be counted a second time.
+      fail) report_line "$name" "$detail"; note_failure ;;
+      line) report_line "" "$name$detail" ;;
+    esac
+  done
+  # The loop ends on read returning 1 (EOF). Return 0 so a caller under set -e is
+  # not aborted before its own cleanup, and so the failure signal stays the
+  # SYNC_FAILURES count, never this function's exit status.
+  return 0
+}
+
+codex_add() {
+  local bin="$1" name="$2" url="$3" var="$4"
+  if [ -n "$var" ]; then
+    "$bin" mcp add "$name" --url "$url" --bearer-token-env-var "$var" >/dev/null 2>&1 </dev/null
+  else
+    "$bin" mcp add "$name" --url "$url" >/dev/null 2>&1 </dev/null
+  fi
+}
+
+sync_codex() {
+  local bin tmp list name kind url var cur_url cur_var action declared backup
+  bin="$(codex_bin)"
+  printf '  codex\n'
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    printf '    (not on PATH; nothing projected)\n'
+    return 0
+  fi
+  list="$(codex_list_tsv "$bin")"
+  declared=""
+  backup=""
+  tmp="$(mktemp)"
+  # Plan and apply into report_projection's status stream, then report from it.
+  # The brace group is REDIRECTED TO A FILE, NOT PIPED, so it stays in this shell
+  # (backup_target's globals survive) and the reporter is not in a pipe subshell
+  # (its note_failure count survives). What is codex-specific lives inside: codex
+  # has no in-place update, so an update is a remove then an add, and the gap
+  # between them is the risk. An add that fails once left NO server where a
+  # working one stood, so back the config up, keep the old entry in hand and put
+  # it back; if even that restore fails, say the server is gone and name the
+  # backup. report_projection owns the report wording; here we only emit tokens.
+  {
+    while IFS=$'\t' read -r name kind url var; do
+      [ -n "$name" ] || continue
+      declared="$declared|$name|"
+      if [ "$kind" != http ]; then
+        printf '%s\t%s\n' "$kind" "$name"
+        continue
+      fi
+      cur_url="$(printf '%s\n' "$list" | awk -F '\t' -v n="$name" '$1 == n { print $2; exit }')"
+      cur_var="$(printf '%s\n' "$list" | awk -F '\t' -v n="$name" '$1 == n { print $3; exit }')"
+      # The env var name counts as much as the url: a server added before its key
+      # existed is present, reachable-looking, and answers nothing.
+      if [ -n "$cur_url" ] && [ "$cur_url" = "$url" ] && [ "$cur_var" = "$var" ]; then
+        printf 'unchanged\t%s\n' "$name"
+        continue
+      fi
+      if [ -n "$cur_url" ]; then action=updated; else action=added; fi
+      if [ "$DRY_RUN" = 1 ]; then
+        printf '%s\t%s\n' "$action" "$name"
+        continue
+      fi
+      backup_target "$(codex_config)"
+      if [ -n "$LAST_BACKUP" ]; then backup="$LAST_BACKUP"; fi
+      if [ "$action" = updated ]; then
+        "$bin" mcp remove "$name" >/dev/null 2>&1 </dev/null || true
+      fi
+      if codex_add "$bin" "$name" "$url" "$var"; then
+        printf '%s\t%s\n' "$action" "$name"
+        continue
+      fi
+      if [ "$action" != updated ]; then
+        printf 'fail\t%s\tfailed (codex mcp add)\n' "$name"
+        continue
+      fi
+      if codex_add "$bin" "$name" "$cur_url" "$cur_var"; then
+        printf 'fail\t%s\tfailed (codex mcp add); rolled back to the previous entry\n' "$name"
+      else
+        printf 'fail\t%s\tfailed (codex mcp add) and REMOVED: the previous entry could not be restored\n' "$name"
+        printf 'line\t\trestore it by hand from %s\n' \
+          "${backup:-(no backup: there was no codex config before this run)}"
+      fi
+    done <"$SERVERS_FILE"
+    while IFS=$'\t' read -r name url var; do
+      [ -n "$name" ] || continue
+      case "$declared" in
+        *"|$name|"*) continue ;;
+      esac
+      printf 'orphan\t%s\n' "$name"
+    done <<EOF_CODEX_ORPHANS
+$list
+EOF_CODEX_ORPHANS
+  } >"$tmp"
+  report_projection codex <"$tmp"
+  rm -f "$tmp"
+}
+
+# Gemini has no add-with-a-header CLI form, so this is a read-modify-write of
+# its settings file. It expands environment variables in that file, which is
+# what makes the reference shape possible: the literal "Bearer $VAR" is stored,
+# never the token behind it.
+sync_gemini() {
+  local settings tmp out
+  settings="$(gemini_settings)"
+  printf '  gemini\n'
+  tmp="$(mktemp)"
+  out="$(python3 - "$settings" "$tmp" "$SERVERS_FILE" <<'PY'
+import json, pathlib, sys
+
+settings = pathlib.Path(sys.argv[1])
+out = pathlib.Path(sys.argv[2])
+rows = pathlib.Path(sys.argv[3]).read_text().splitlines()
+
+data = {}
+if settings.exists():
+    raw = settings.read_text().strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            print("unreadable\t(settings file is not valid JSON; left untouched)")
+            sys.exit(0)
+if not isinstance(data, dict):
+    print("unreadable\t(settings file is not a JSON object; left untouched)")
+    sys.exit(0)
+
+servers = data.get("mcpServers")
+if not isinstance(servers, dict):
+    servers = {}
+
+changed = False
+declared = set()
+for row in rows:
+    if not row.strip():
+        continue
+    name, kind, url, var = (row.split("\t") + ["", "", ""])[:4]
+    declared.add(name)
+    if kind != "http":
+        # stdio, none and refused all come straight back out: the bash side owns
+        # the wording so all three harnesses give the same reason for the same
+        # server, and a refused name never reaches this file.
+        print(kind + "\t" + name)
+        continue
+    want = {"httpUrl": url}
+    if var:
+        want["headers"] = {"Authorization": "Bearer $" + var}
+    current = servers.get(name)
+    if isinstance(current, dict) and all(current.get(k) == v for k, v in want.items()):
+        print("unchanged\t" + name)
+        continue
+    # Merge rather than replace: a timeout or a trust flag the founder set on
+    # this server by hand is not ours to drop just because we own the url.
+    merged = dict(current) if isinstance(current, dict) else {}
+    merged.update(want)
+    servers[name] = merged
+    changed = True
+    print(("updated" if current is not None else "added") + "\t" + name)
+
+# Report only. A server the founder added inside gemini by hand looks exactly
+# like one the primary config dropped, and this verb does not get to decide.
+for name in sorted(set(servers) - declared):
+    print("orphan\t" + name)
+
+if changed:
+    data["mcpServers"] = servers
+    out.write_text(json.dumps(data, indent=2) + "\n")
+PY
+)"
+  # The python above planned the upsert into the same status stream codex emits
+  # (stdio/none/refused, unchanged, added/updated, orphan, unreadable), so one
+  # reporter renders both. Fed by heredoc, never a pipe: see report_projection.
+  report_projection gemini <<EOF_GEMINI
+$out
+EOF_GEMINI
+  if [ -s "$tmp" ] && [ "$DRY_RUN" != 1 ]; then
+    backup_target "$settings"
+    mkdir -p "$(dirname "$settings")"
+    mv "$tmp" "$settings"
+  fi
+  rm -f "$tmp"
+}
+
+# The config path as it should READ in a profile: a literal home path breaks the
+# moment the account moves, and the founder's existing line already uses ~.
+profile_config_path() {
+  local path
+  path="$(claude_config)"
+  case "$path" in
+    "$HOME"/*) printf '~%s\n' "${path#"$HOME"}" ;;
+    *) printf '%s\n' "$path" ;;
+  esac
+}
+
+sync_profile() {
+  local profile name kind url var any=0
+  profile="$(shell_profile)"
+  printf '  environment (%s)\n' "$profile"
+  while IFS=$'\t' read -r name kind url var; do
+    [ -n "$var" ] || continue
+    any=1
+    # The line below DERIVES the token with jq at every shell start. Without jq
+    # it would export an empty string for ever while the report said "added",
+    # which is the same silence as a rotated key. Say what is true instead.
+    if [ "$JQ_PRESENT" != 1 ]; then
+      printf "    %-${VAR_WIDTH}s blocked (jq not on PATH; install jq, then re-run sync)\n" "$var"
+      note_failure
+      continue
+    fi
+    # COVERED IS COVERED, whoever wrote it. The founder's own AFTERLAUNCH_API_KEY
+    # block predates this verb and works; matching on the export rather than on
+    # our marker is what stops sync appending a second one beside it.
+    if [ -f "$profile" ] && grep -qE "^[[:space:]]*export[[:space:]]+$var=" "$profile"; then
+      printf "    %-${VAR_WIDTH}s unchanged (already exported)\n" "$var"
+      continue
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+      printf "    %-${VAR_WIDTH}s added (dry-run)\n" "$var"
+      continue
+    fi
+    backup_target "$profile"
+    # The name is charset-validated upstream AND passed as --arg data, so it can
+    # be neither shell nor jq program text here. Belt and braces on purpose: the
+    # quoting in this heredoc is exactly what a QA pass broke out of.
+    {
+      printf '\n# samepage sync: %s for the harnesses that are not Claude.\n' "$var"
+      printf '# Derived at shell start rather than pasted, so the secret keeps exactly ONE\n'
+      printf '# copy on disk: rotate it in the primary config and every harness follows.\n'
+      printf 'export %s="$(jq -r --arg n '\''%s'\'' '\''%s'\'' %s 2>/dev/null | head -1 | sed '\''s/^Bearer //'\'')"\n' \
+        "$var" "$name" "$JQ_AUTH_FILTER" "$(profile_config_path)"
+    } >>"$profile"
+    printf "    %-${VAR_WIDTH}s added\n" "$var"
+  done <"$SERVERS_FILE"
+  [ "$any" = 1 ] || printf '    (no bearer-token servers; nothing to derive)\n'
+}
+
+# What each harness is allowed to do without asking. Read-only on purpose: this
+# is the founder's call, and the point of showing it in one place is that three
+# separate trust models are otherwise three separate files nobody opens.
+trust_posture() {
+  local settings codexcfg geminicfg value
+  printf 'TRUST POSTURE (read only)\n'
+
+  settings="$(claude_settings)"
+  if [ -f "$settings" ]; then
+    value="$(python3 -c '
+import json, sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    data = {}
+allow = ((data.get("permissions") or {}).get("allow") or [])
+count = len(allow)
+print("%d rule%s" % (count, "" if count == 1 else "s"))
+' "$settings")"
+    printf '  claude   permissions.allow: %s\n' "$value"
+  else
+    printf '  claude   no settings at %s\n' "$settings"
+  fi
+
+  codexcfg="$(codex_config)"
+  if [ -f "$codexcfg" ]; then
+    value="$(grep -E '^[[:space:]]*(trust_level|approvals_reviewer)[[:space:]]*=' "$codexcfg" 2>/dev/null | tr -d ' ' | tr '\n' ' ' | sed 's/ $//' || true)"
+    printf '  codex    %s\n' "${value:-no trust_level or approvals_reviewer set}"
+  else
+    printf '  codex    no config at %s\n' "$codexcfg"
+  fi
+
+  geminicfg="$(gemini_settings)"
+  if [ -f "$geminicfg" ]; then
+    value="$(python3 -c '
+import json, sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    data = {}
+print(((data.get("security") or {}).get("auth") or {}).get("selectedType") or "")
+' "$geminicfg")"
+    printf '  gemini   security.auth.selectedType: %s\n' "${value:-not set}"
+  else
+    printf '  gemini   no settings at %s\n' "$geminicfg"
+  fi
+}
+
+# ASK THE HARNESS, do not trust the write. A projection that landed in a file is
+# not a connection; the file could name a server the harness cannot reach.
+export_derived_vars() {
+  local name kind url var value cfg
+  cfg="$(claude_config)"
+  command -v jq >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r name kind url var; do
+    [ -n "$var" ] || continue
+    value="$(derive_auth "$name" "$cfg")"
+    if [ -n "$value" ]; then
+      # In this process only. It dies with the command; nothing writes it down.
+      export "$var=$value"
+    fi
+  done <"$SERVERS_FILE"
+}
+
+verify_connections() {
+  local bin
+  printf 'VERIFY\n'
+  export_derived_vars
+
+  # A section that is simply absent reads as a section that passed. Say which
+  # harness could not be asked, and why, or VERIFY is quietly worth less than
+  # it looks.
+  bin="$(codex_bin)"
+  if command -v "$bin" >/dev/null 2>&1; then
+    printf '\n  $ codex mcp list\n'
+    "$bin" mcp list 2>&1 </dev/null || true
+  else
+    printf '\n  codex not verified: %s is not on PATH\n' "$bin"
+  fi
+
+  bin="$(gemini_bin)"
+  if command -v "$bin" >/dev/null 2>&1; then
+    printf '\n  $ gemini mcp list\n'
+    "$bin" mcp list 2>&1 </dev/null || true
+  else
+    printf '\n  gemini not verified: %s is not on PATH\n' "$bin"
+  fi
+
+  printf '\n  A server listed Disconnected here is usually waiting for a one-time\n'
+  printf '  OAuth inside that harness (Resend is the known case): open it once and\n'
+  printf '  approve. That is not a sync failure, and re-running sync will not fix it.\n'
+}
+
+# ---------------------------------------------------------------------------
+# Prime text
+# ---------------------------------------------------------------------------
+
+prime_text() {
+  require_brain
+  local self
+  self="$(detect_self)"
+  printf 'samepage %s\n' "$VERSION"
+  printf 'project: %s\n' "$PROJECT"
+  printf 'you: %s\n' "$self"
+  if [ -f "$(roster_path)" ]; then
+    printf 'peers:\n'
+    awk -F '\t' 'NR > 1 { printf "  - %s (%s) %s\n", $1, $2, $3 }' "$(roster_path)"
+  fi
+  printf '\n--- PROTOCOL (read fully) ---\n'
+  printf 'file: %s\n' "$(brain_dir)/PROTOCOL.md"
+  # The project's real memory, read through the link rather than copied. The
+  # index names every fact and where it lives; an agent that needs one opens it.
+  printf '\n--- MEMORY INDEX (%s) ---\n' "$(brain_dir)/memory/MEMORY.md"
+  if [ -f "$(brain_dir)/memory/MEMORY.md" ]; then
+    head -n 60 "$(brain_dir)/memory/MEMORY.md"
+    printf '\n[%s more files in %s]\n' \
+      "$(find -L "$(brain_dir)/memory" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')" \
+      "$(brain_dir)/memory"
+  else
+    printf '(no memory estate here: this project has no Claude Code memory\nto link, which is normal outside Claude. SHARED.md below is the record.)\n'
+  fi
+  printf '\n--- SHARED LOG (what other agents wrote) ---\n'
+  if [ -f "$(shared_log)" ]; then
+    tail -n 25 "$(shared_log)"
+  fi
+  printf '\n--- IN FLIGHT on %s ---\n' "$(current_branch)"
+  if [ -f "$(wip_path)" ]; then
+    cat "$(wip_path)"
+  else
+    printf '(nothing recorded; write one with samepage wip "...")\n'
+  fi
+  printf '\n--- SKILLS ---\n'
+  if [ -d "$(brain_dir)/skills" ]; then
+    find -L "$(brain_dir)/skills" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; 2>/dev/null | sort | tr '\n' ' '
+    printf '\n(read %s/<name>/SKILL.md)\n' "$(brain_dir)/skills"
+  fi
+  printf '\n--- STATUS ---\n'
+  if [ -f "$(brain_dir)/STATUS.md" ]; then
+    cat "$(brain_dir)/STATUS.md"
+  fi
+  local open
+  open="$(open_handoffs || true)"
+  if [ -n "$open" ]; then
+    printf '\n--- OPEN HANDOFFS ---\n%s\n' "$open"
+  fi
+  return 0
+}
+
+peer_bootstrap_prompt() {
+  local provider="$1"
+  cat <<EOF
+You are the $provider pane in a samepage workspace. Shared brain: $PROJECT/.samepage/
+
+Run: samepage prime
+Then follow .samepage/PROTOCOL.md. Do not ask the user to re-explain anything the memory estate or the in-flight record already holds. Durable lesson: samepage remember "...". Part-way through something: samepage wip "...", early and updated.
+EOF
+}
+
+open_handoffs() {
+  local path
+  path="$(events_path)"
+  [ -f "$path" ] || return 0
+  awk -F '\t' '$2 == "handoff" { print }' "$path" | tail -n 8
+}
+
+# ---------------------------------------------------------------------------
+# The digest: what a pane needs at session start, in forty lines
+# ---------------------------------------------------------------------------
+#
+# WHY FORTY. The old prime printed 28,358 bytes and 136 lines, with the shared
+# log in it twice. A pane that is handed that at boot spends its first minute
+# reading, and a founder who runs it in six panes at once watches six agents go
+# quiet. Everything in the long form is still one command away; this is the
+# part that changes what the next turn does.
+
+DIGEST_WIDTH=120
+DIGEST_MAX_LINES=40
+
+# One pass over the finished digest, so a long note costs one row and not two.
+# Done in python because a byte-wise cut lands in the middle of a character and
+# the notes are prose the founder wrote.
+cut_lines() {
+  python3 -c '
+import sys
+w = int(sys.argv[1])
+for line in sys.stdin.read().splitlines():
+    print(line if len(line) <= w else line[:w - 1] + "…")
+' "$DIGEST_WIDTH"
+}
+
+# The note a pane wrote, minus the header this tool put there itself. A board
+# that echoes "# in flight: main" once per pane has said nothing at all.
+wip_body() {
+  [ -f "$1" ] || return 0
+  awk '
+    /^#/ { next }
+    /^- updated / { next }
+    /^- head: / { next }
+    /^[[:space:]]*$/ { next }
+    { print }
+  ' "$1"
+}
+
+wip_first_line() {
+  wip_body "$1" | awk 'NR == 1 { print; exit }'
+}
+
+# How long since that pane last said anything, in the coarsest unit that is
+# still true. Precision would be false here: the note is written by hand.
+wip_age_label() {
+  local m now age
+  m="$(file_mtime "$1")"
+  if [ "$m" = 0 ]; then
+    printf 'never\n'
+    return 0
+  fi
+  now="$(date -u +%s)"
+  age=$((now - m))
+  [ "$age" -lt 0 ] && age=0
+  if [ "$age" -lt 3600 ]; then
+    printf '%sm\n' $((age / 60))
+  elif [ "$age" -lt 86400 ]; then
+    printf '%sh\n' $((age / 3600))
+  else
+    printf '%sd\n' $((age / 86400))
+  fi
+}
+
+# The LIVE rows of the memory index, which is the part of the estate that says
+# what is true this week. The rest of the index is a map and stays one command
+# away rather than in every pane's first screen.
+live_rows() {
+  local index
+  index="$(brain_dir)/memory/MEMORY.md"
+  [ -f "$index" ] || return 0
+  awk '
+    /^## LIVE/ { on = 1; next }
+    /^## / { on = 0 }
+    on && /^- / { print }
+  ' "$index"
+}
+
+# The last few lessons anyone wrote. Only what comes after the "## Log" header
+# counts, where the file has one: it opens with a paragraph explaining what it
+# is for, and on a fresh brain with no lessons in it yet that paragraph IS the
+# tail. Printing the instructions back as though they were the newest thing
+# anyone had learned is a confident way of saying nothing.
+lesson_rows() {
+  local log
+  log="$(shared_log)"
+  [ -f "$log" ] || return 0
+  if grep -q '^## Log' "$log" 2>/dev/null; then
+    awk '/^## Log/ { on = 1; next } on && !/^#/ && NF { print }' "$log" | tail -n "$1"
+  else
+    awk '!/^#/ && NF { print }' "$log" | tail -n "$1"
+  fi
+}
+
+# CHEAP AND HONEST. Two panes overlap when words from one's task appear in the
+# other's note. Substring matching over words of four characters or more, plus
+# anything path-shaped, is crude and it is meant to be: this is a hint that
+# makes a human ask, never a lock. A lock built on a guess is worse than none.
+overlap_rows() {
+  local task="$1" self_key="$2"
+  [ -n "$task" ] || return 0
+  local tokens tok body matches count scored=""
+  local rname rprovider rsurface rpane rcwd rbranch rest
+  tokens="$(printf '%s' "$task" | tr '[:upper:]' '[:lower:]' \
+    | tr -c 'a-z0-9/._-' '\n' \
+    | awk 'NF && (length($0) >= 4 || $0 ~ /[\/.]/)' | sort -u)"
+  [ -n "$tokens" ] || return 0
+  while IFS="	" read -r rname rprovider rsurface rpane rcwd rbranch rest; do
+    [ -n "$rprovider" ] || continue
+    is_self_row "$rname" "$rsurface" "$self_key" && continue
+    body="$(wip_body "$(branch_wip_path "$rbranch")" | tr '[:upper:]' '[:lower:]')"
+    [ -n "$body" ] || continue
+    matches=""
+    count=0
+    for tok in $tokens; do
+      case "$body" in
+        *"$tok"*)
+          matches="${matches:+$matches, }$tok"
+          count=$((count + 1))
+          ;;
+      esac
+    done
+    [ "$count" -gt 0 ] || continue
+    scored="${scored}${count}	${rprovider} on ${rbranch}: ${matches}"$'\n'
+  done <<EOF
+$(roster_rows)
+EOF
+  [ -n "$scored" ] || return 0
+  printf '%s' "$scored" | sort -rn | cut -f2-
+}
+
+# Which roster row is me. Inside cmux a pane is its surface; outside it there is
+# no surface to be, and the provider name is the best key left. Two panes of one
+# provider outside cmux are genuinely indistinguishable from here, so the name
+# match applies ONLY to rows that carry no surface: marking a colleague's pane
+# "(you)" tells the reader their own note is somebody else's.
+digest_self_key() {
+  if cmux_ok; then
+    mux_self_target cmux
+  else
+    detect_self
+  fi
+}
+
+is_self_row() {
+  local rname="$1" rsurface="$2" self_key="$3"
+  [ -n "$self_key" ] || return 1
+  if cmux_ok; then
+    [ "$rsurface" = "$self_key" ]
+    return
+  fi
+  [ "$rsurface" = "-" ] || [ -z "$rsurface" ] || return 1
+  [ "$rname" = "$self_key" ]
+}
+
+digest_body() {
+  local live_max="$1" lesson_max="$2" handoffs_on="$3"
+  local self self_key branch rows n live total lessons over hand
+  local rname rprovider rsurface rpane rcwd rbranch rest
+  local note age mark
+  self="$(detect_self)"
+  self_key="$(digest_self_key)"
+  branch="$(current_branch)"
+  rows="$(roster_rows)"
+  n="$(printf '%s\n' "$rows" | awk 'NF' | wc -l | tr -d ' ')"
+
+  printf 'samepage %s · %s · you: %s on %s\n' "$VERSION" "$(basename "$PROJECT")" "$self" "$branch"
+  if [ "$ROSTER_STALE" = 1 ]; then
+    printf 'PANES 0 live (the board is in an older format; the next real run rebuilds it)\n'
+  else
+    printf 'PANES %s live\n' "$n"
+  fi
+  while IFS="	" read -r rname rprovider rsurface rpane rcwd rbranch rest; do
+    [ -n "$rprovider" ] || continue
+    note="$(wip_first_line "$(branch_wip_path "$rbranch")")"
+    [ -n "$note" ] || note="(no note)"
+    age="$(wip_age_label "$(branch_wip_path "$rbranch")")"
+    mark=""
+    if is_self_row "$rname" "$rsurface" "$self_key"; then
+      mark=" (you)"
+    fi
+    printf '  %s%s %s  %s  %s  · %s\n' \
+      "$rprovider" "$mark" "${rsurface:--}" "${rbranch:--}" "$note" "$age"
+  done <<EOF
+$rows
+EOF
+
+  live="$(live_rows)"
+  if [ -n "$live" ]; then
+    total="$(printf '%s\n' "$live" | awk 'NF' | wc -l | tr -d ' ')"
+    printf 'LIVE\n'
+    printf '%s\n' "$live" | awk -v m="$live_max" 'NF && c < m { print "  " $0; c++ }'
+    if [ "$total" -gt "$live_max" ]; then
+      printf '  +%s more in the index; samepage recall <word>\n' "$((total - live_max))"
+    fi
+  fi
+
+  lessons="$(lesson_rows "$lesson_max")"
+  if [ -n "$lessons" ]; then
+    printf 'LESSONS\n'
+    printf '%s\n' "$lessons" | awk 'NF { print "  " $0 }'
+  fi
+
+  if [ -n "$TASK" ]; then
+    printf 'OVERLAP\n'
+    over="$(overlap_rows "$TASK" "$self_key")"
+    if [ -n "$over" ]; then
+      printf '%s\n' "$over" | awk 'NF { print "  " $0 }'
+    else
+      printf '  none found\n'
+    fi
+  fi
+
+  if [ "$handoffs_on" = 1 ]; then
+    hand="$(open_handoffs || true)"
+    if [ -n "$hand" ]; then
+      printf 'HANDOFFS\n'
+      printf '%s\n' "$hand" | awk -F '\t' 'NF && c < 3 { printf "  %s %s\n", $3, $4; c++ }'
+    fi
+  fi
+
+  printf 'RULE  If OVERLAP names a pane, tell the user which files it touches and ask before editing them.\n'
+  printf '      Your own note, early: samepage wip "…". A durable lesson: samepage remember "…".\n'
+}
+
+# CUT THE SOFT PARTS, NEVER THE PANES. Who is open and what the rule is are the
+# two things this exists to say; the memory rows and the lessons are context,
+# and context is what a budget spends first.
+digest_text() {
+  require_brain
+  local out combo n
+  out=""
+  for combo in "10 3 1" "5 3 1" "5 2 1" "5 2 0"; do
+    # shellcheck disable=SC2086
+    set -- $combo
+    out="$(digest_body "$1" "$2" "$3")"
+    n="$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+    if [ "$n" -le "$DIGEST_MAX_LINES" ]; then
+      break
+    fi
+  done
+  printf '%s\n' "$out" | cut_lines
+}
+
+# ---------------------------------------------------------------------------
+# Adopt: the panes that are ALREADY open
+# ---------------------------------------------------------------------------
+
+# THE BRAIN IS FILES, AND A RUNNING AGENT READ ITS INSTRUCTIONS AT BOOT.
+# Writing .samepage/ reaches every session that starts after the write and no
+# session that started before it. That is the whole first-run disappointment:
+# a founder with six panes open runs init, is told the brain is live, asks a
+# pane whether it is on the same page, and it has never heard of the place.
+# Nothing can push text into a running agent's context, so the only honest
+# mechanism is the one a human would use, which is to type into the pane.
+
+# WHAT NAMES AN AGENT IS ITS COMMAND LINE, NEVER ITS PROCESS NAME.
+#
+# Two measurements, both on macOS, both fatal to the obvious approach. `comm`
+# is truncated to 16 characters, so a real Claude Code reads as
+# "/opt/homebrew/bi". And every node-based CLI (Claude, Codex, Gemini) reports
+# as plain "node" in a multiplexer's foreground-command field, even when argv[0]
+# says otherwise: measured under tmux 3.7c, `exec -a claude node ...` still
+# lists as "node". So match the basename of argv[0], and when that turns out to
+# be a runtime, look one token along at the script it was handed.
+#
+# ONE matcher, used by every driver. Two ways to answer "is this an agent" is
+# two answers, and the one nobody exercises is the one that rots.
+PS_WALK_AWK='
+function base(s,   t) { t = s; sub(/^.*\//, "", t); return t }
+function name_of(b) {
+  if (b ~ /^claude/) return "claude"
+  if (b ~ /^codex/) return "codex"
+  if (b ~ /^grok/) return "grok"
+  if (b ~ /^gemini/) return "gemini"
+  if (b ~ /^opencode/) return "opencode"
+  if (b ~ /^agy/) return "antigravity"
+  return ""
+}
+function prov(args,   f, s, p) {
+  f = args; sub(/ .*$/, "", f)
+  p = name_of(base(f)); if (p != "") return p
+  # macOS resolves python3 to a framework binary whose argv[0] basename is
+  # "Python", capital P, and versioned names are normal everywhere. A python
+  # agent CLI (aider is one) is invisible without this.
+  if (base(f) !~ /^([Nn]ode|bun|deno|[Pp]ython[0-9.]*|npx|uvx?)$/) return ""
+  s = args; sub(/^[^ ]+ +/, "", s); sub(/ .*$/, "", s)
+  return name_of(base(s))
+}
+{
+  pid = $1; ppid = $2
+  args = $0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", args)
+  P[pid] = ppid; A[pid] = args; ids[++n] = pid
+}
+END {
+  tail = 1
+  split(roots, r, " ")
+  for (k in r) if (r[k] != "") q[tail++] = r[k]
+  head = 1
+  while (head < tail) {
+    cur = q[head++]
+    p = prov(A[cur])
+    if (p != "") { print p "\t" cur; exit }
+    for (i = 1; i <= n; i++) if (P[ids[i]] == cur) q[tail++] = ids[i]
+  }
+}'
+
+# "provider<TAB>pid" for the first agent at or under any of these pids. Empty
+# when the pane holds nothing but a shell.
+agent_under() {
+  printf '%s\n' "$2" | awk -v roots="$1" "$PS_WALK_AWK"
+}
+
+ps_snapshot() {
+  ps -eo pid=,ppid=,args= 2>/dev/null || true
+}
+
+# Every pane on the machine comes back, including ones working on other repos.
+# A pane's working directory is the only thing that says which project it
+# belongs to, and adopting someone else's pane is worse than adopting none.
+surface_cwd() {
+  lsof -a -d cwd -p "$1" -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+}
+
+# --- drivers ---------------------------------------------------------------
+# Each emits: driver, target, provider, agent pid, cwd, pane label.
+# A driver that is not present prints nothing and is not an error.
+
+cmux_rows() {
+  cmux_ok || return 0
+  local procs surfaces surface pane pids hit provider agent_pid cwd
+  procs="$(ps_snapshot)"
+  surfaces="$(cmux top --all --processes --format tsv 2>/dev/null | awk -F '\t' '
+    $4 == "surface" { pane[$5] = $6 }
+    $4 == "process" && $6 ~ /^surface:[0-9]+$/ { pids[$6] = pids[$6] " " $5 }
+    END { for (s in pids) printf "%s\t%s\t%s\n", s, (s in pane ? pane[s] : "-"), pids[s] }' || true)"
+  [ -n "$surfaces" ] || return 0
+  while IFS="	" read -r surface pane pids; do
+    [ -n "$surface" ] || continue
+    hit="$(agent_under "$pids" "$procs")"
+    [ -n "$hit" ] || continue
+    provider="$(printf '%s' "$hit" | cut -f1)"
+    agent_pid="$(printf '%s' "$hit" | cut -f2)"
+    # cmux knows nothing about a pane's directory, so the process must say.
+    cwd="$(surface_cwd "$agent_pid")"
+    [ -n "$cwd" ] || continue
+    printf 'cmux\t%s\t%s\t%s\t%s\t%s\n' "$surface" "$provider" "$agent_pid" "$cwd" "$pane"
+  done <<EOF
+$surfaces
+EOF
+}
+
+# tmux hands over the pane's working directory directly, which is strictly
+# better than anything the cmux path can get: it tracks the shell's cwd rather
+# than the directory the agent was launched from.
+tmux_rows() {
+  have_tmux || return 0
+  local panes procs target shell_pid cwd hit provider agent_pid tmux_cmd
+  tmux_cmd="$(tmux_bin)"
+  panes="$("$tmux_cmd" list-panes -a -F '#{pane_id}	#{pane_pid}	#{pane_current_path}' 2>/dev/null)" || return 0
+  [ -n "$panes" ] || return 0
+  procs="$(ps_snapshot)"
+  while IFS="	" read -r target shell_pid cwd; do
+    [ -n "$target" ] || continue
+    hit="$(agent_under "$shell_pid" "$procs")"
+    [ -n "$hit" ] || continue
+    provider="$(printf '%s' "$hit" | cut -f1)"
+    agent_pid="$(printf '%s' "$hit" | cut -f2)"
+    printf 'tmux\t%s\t%s\t%s\t%s\t%s\n' "$target" "$provider" "$agent_pid" "$cwd" "-"
+  done <<EOF
+$panes
+EOF
+}
+
+mux_rows() {
+  cmux_rows
+  tmux_rows
+}
+
+# ASKING WHO I AM MUST NEVER BE WHAT KILLS THE RUN. Called unguarded, this
+# reached for `cmux` on a box that has only tmux and died 127 under set -e,
+# before the digest, which is the one thing every caller came for. It answers
+# empty instead, and the caller decides what empty means.
+mux_self_target() {
+  case "$1" in
+    cmux)
+      cmux_ok || return 0
+      cmux_caller_surface || true
+      ;;
+    tmux) printf '%s\n' "${TMUX_PANE:-}" ;;
+    *) : ;;
+  esac
+  return 0
+}
+
+# INSIDE CMUX AND UNABLE TO NAME MY OWN PANE IS THE ONE STATE THAT MUST FAIL
+# CLOSED. Self-exclusion is a string comparison against the caller's surface, so
+# an empty answer (jq missing, `cmux identify` reshaped) excludes nobody and the
+# pulse goes into the pane the founder is reading. Outside cmux there is no
+# confusion to have: there is no surface to be.
+self_pane_unknown() {
+  cmux_ok || return 1
+  [ -z "$(mux_self_target cmux)" ]
+}
+
+mux_send() {
+  local driver="$1" target="$2" line="$3"
+  case "$driver" in
+    cmux)
+      cmux send --surface "$target" "$line" >/dev/null 2>&1 || return 1
+      # A trailing newline TYPES into an agent TUI without submitting it.
+      cmux send-key --surface "$target" Enter >/dev/null 2>&1 || true
+      ;;
+    tmux)
+      # tmux takes the key as its own argument, so the mistake that cost an
+      # evening on the cmux path cannot be made here.
+      "$(tmux_bin)" send-keys -t "$target" "$line" Enter >/dev/null 2>&1 || return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# What was running that this did NOT recognise, reported only when nothing
+# matched anywhere. "No agent panes found" is a lie to anyone driving a CLI
+# that is not on the list, and it sends them off to debug the wrong thing.
+# The list of agents is a list, and lists go out of date.
+unmatched_labels() {
+  {
+    cmux_ok && cmux top --all --processes --format tsv 2>/dev/null | awk -F '\t' '
+      $4 == "process" && $6 ~ /^surface:[0-9]+$/ { print $7 }'
+    have_tmux && "$(tmux_bin)" list-panes -a -F '#{pane_current_command}' 2>/dev/null
+  } 2>/dev/null | awk '
+    /^(claude|codex|grok|gemini|opencode|agy|zsh|bash|fish|sh|login|caffeinate|sleep|com\.apple)/ { next }
+    !seen[$0]++ { printf "%s%s", (n++ ? ", " : ""), $0 }
+    END { if (n) printf "\n" }' || true
+}
+
+# WHICH PANES ARE OURS: THE SAME REPOSITORY, ANY WORKTREE OF IT.
+#
+# A pane belongs here if its directory is inside the project, or if it sits in
+# any checkout that shares this repository's primary .git. That covers the
+# sibling worktree, which is the case this tool now cares most about, because
+# the board is one board across every checkout.
+#
+# A directory INSIDE NO REPOSITORY IS REFUSED, and that is a deliberate change
+# of trade. The old rule accepted a parent folder that merely contains the
+# project, on the reasoning that an agent keeps the directory it was launched
+# from. It also accepted a home directory, which is a parent of everything: a
+# Claude sitting in $HOME was adopted four times in three minutes and the
+# founder watched every terminal go berserk. The two costs are not symmetric. A
+# wrong adoption costs somebody else a minute of their pane and their trust; a
+# missed one costs a `samepage` run in the pane that missed it. So the guess is
+# gone and only provable membership is accepted.
+BELONGS_ROOT=""
+BELONGS_ROOT_COMMON=""
+belongs_to_project() {
+  local cwd="$1" root="$2" mine theirs
+  # THE REPOSITORY DECIDES, NOT THE PATH. A prefix test alone accepts a
+  # DIFFERENT repository that happens to sit inside this tree (a vendored
+  # checkout, a fixture repo, another worktree of something else), and adopting
+  # a pane working in one of those is the same wrong answer as adopting a pane
+  # across the machine. So the common-dir comparison comes first, and the cheap
+  # containment test is the fallback for a project that is in no repository at
+  # all, where containment is the only fact available.
+  if [ "$BELONGS_ROOT" = "$root" ]; then
+    mine="$BELONGS_ROOT_COMMON"
+  else
+    mine="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    BELONGS_ROOT="$root"
+    BELONGS_ROOT_COMMON="$mine"
+  fi
+  if [ -z "$mine" ]; then
+    case "$cwd" in
+      "$root"|"$root"/*) return 0 ;;
+    esac
+    return 1
+  fi
+  theirs="$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  [ -n "$theirs" ] || return 1
+  # BOTH SIDES RESOLVED BEFORE THEY ARE COMPARED. A linked worktree records the
+  # path it was created with, and a caller may hand us the same directory
+  # through a symlink (/tmp on a Mac is one), so the two answers can name one
+  # directory in two spellings and a string compare would refuse a sibling
+  # worktree of the very same repository.
+  theirs="$(cd "$theirs" 2>/dev/null && pwd -P)" || return 1
+  mine="$(cd "$mine" 2>/dev/null && pwd -P)" || return 1
+  [ "$theirs" = "$mine" ]
+}
+
+# ONE LINE, AND IT NAMES THE PROJECT.
+#
+# A process keeps the directory it was LAUNCHED from, so no amount of cleverness
+# turns that into proof of which project a pane is working on: the guess above
+# is a good guess and it will sometimes be wrong. Naming the path is what makes
+# being wrong harmless, because a pane working somewhere else can read the line,
+# see a path that is not its own, and ignore it.
+adopt_line() {
+  printf 'samepage: the project at %s has a shared brain. If that is the project you are working on, run: samepage prime  then follow its .samepage/PROTOCOL.md and do not ask me again for anything already in it. If you are working somewhere else, ignore this message.\n' "$1"
+}
+
+cmd_adopt_inner() {
+  local rows driver target provider pid cwd pane root n=0 names=""
+  local self_cmux self_tmux seen_other pulsed pulse_cut
+  # THE SAME TEN-MINUTE WINDOW THE SONAR KEEPS. adopt used to have no memory of
+  # who it had reached, so four runs in three minutes typed four times into every
+  # pane on the machine. One record of when a pane was last messaged fixes both
+  # verbs at once, because they both write it.
+  pulse_cut="$(iso_ago 10)"
+  self_cmux="$(mux_self_target cmux)"
+  self_tmux="$(mux_self_target tmux)"
+  # FAIL CLOSED: see self_pane_unknown. Every skip below is a comparison against
+  # my own surface, so not knowing it means typing into my own pane.
+  if self_pane_unknown; then
+    info "cannot tell which pane is mine; no pulse sent"
+    return 0
+  fi
+  # BOTH SIDES RESOLVED, because lsof answers with the real path and a project
+  # reached through a symlink (/tmp on a Mac is one) would match nothing.
+  root="$(cd "$PROJECT" 2>/dev/null && pwd -P)" || root="$PROJECT"
+  rows="$(mux_rows)"
+  if [ -z "$rows" ]; then
+    info "no agent panes recognised in any multiplexer"
+    seen_other="$(unmatched_labels)"
+    [ -n "$seen_other" ] && info "these were running and are not on the known list: $seen_other"
+    info "run 'samepage prime' in each agent by hand, and say which CLI you use"
+    return 0
+  fi
+  while IFS="	" read -r driver target provider pid cwd pane; do
+    [ -n "$target" ] || continue
+    case "$driver" in
+      cmux) [ -n "$self_cmux" ] && [ "$target" = "$self_cmux" ] && continue ;;
+      tmux) [ -n "$self_tmux" ] && [ "$target" = "$self_tmux" ] && continue ;;
+    esac
+    # An agent inside tmux inside cmux is reported by both drivers and is one
+    # pane. The agent's pid is the same either way, so it is the identity.
+    case " $SEEN_PIDS " in
+      *" $pid "*) continue ;;
+    esac
+    SEEN_PIDS="$SEEN_PIDS $pid"
+    cwd="$(cd "$cwd" 2>/dev/null && pwd -P)" || continue
+    belongs_to_project "$cwd" "$root" || continue
+    pulsed="$(roster_pulsed_at "$target")"
+    if [ -n "$pulsed" ] && [ "$pulsed" \> "$pulse_cut" ]; then
+      continue
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+      info "dry-run adopt $provider on $driver $target"
+    else
+      if ! mux_send "$driver" "$target" "$(adopt_line "$root")"; then
+        warn "could not reach $target ($provider via $driver)"
+        continue
+      fi
+      roster_upsert "$provider" "$provider" "$target" "$pane" "$cwd" "$(pane_branch "$cwd")"
+      roster_mark_pulsed "$target"
+      append_event "adopt" "$(detect_self)" "$provider $target"
+    fi
+    n=$((n + 1))
+    names="${names:+$names, }$provider"
+  done <<EOF
+$rows
+EOF
+  if [ "$n" = 0 ]; then
+    info "found agent panes, but none whose directory matches $root"
+  else
+    info "adopted $n pane(s): $names"
+    info "each joins the board when it primes"
+  fi
+}
+
+cmd_adopt() {
+  require_brain
+  if ! cmux_ok && ! have_tmux; then
+    die "no supported multiplexer here (cmux or tmux); run 'samepage prime' once in each agent instead"
+  fi
+  cmd_adopt_inner
+  write_status
+  cmd_status_print
+}
+
+# ---------------------------------------------------------------------------
+# The sonar: one wave out, and everybody's wave back
+# ---------------------------------------------------------------------------
+#
+# THREE BEATS, ONE COMMAND. Listen (make sure the brain is here and read it),
+# pulse (one line to the panes whose note has gone stale, and never the same
+# pane twice inside ten minutes), reflect (wait a few seconds for the notes to
+# land, then print the digest). Everything that made the old first run painful
+# is one of those three doing less: no re-adopting a pane that already answered,
+# no re-syncing a declaration that has not changed, no long prime.
+
+# How long a note stays fresh enough that its pane is worth nothing to ask.
+STALE_MIN="${SAMEPAGE_STALE_MIN:-10}"
+# The floor between two messages to one pane, whoever sends them.
+PULSE_MIN=10
+SONAR_WAIT="${SAMEPAGE_SONAR_WAIT:-8}"
+SONAR_PENDING=""
+
+pulse_line() {
+  printf 'samepage: %s is on %s: %s. Reply by running: samepage wip "<one line on what you are doing right now>"  (nothing else; do not run samepage prime)\n' \
+    "$1" "$2" "$3"
+}
+
+# SYNC IS SLOW AND ALMOST ALWAYS A NO-OP. It rewrites three harnesses and asks
+# two of them to list their servers, which is seconds, and the answer changes
+# only when the primary config's declaration does. So take a signature of that
+# declaration and run the real thing when it moves.
+sync_signature() {
+  local cfg
+  cfg="$(claude_config)"
+  [ -f "$cfg" ] || return 0
+  if command -v shasum >/dev/null 2>&1; then
+    { claude_servers 2>/dev/null || true; } | shasum -a 256 | awk '{ print $1 }'
+  else
+    { claude_servers 2>/dev/null || true; } | cksum | awk '{ print $1 "-" $2 }'
+  fi
+}
+
+sonar_sync_gate() {
+  local cfg sig path
+  cfg="$(claude_config)"
+  if [ ! -f "$cfg" ]; then
+    printf 'sync: no primary harness config at %s\n' "$cfg"
+    return 0
+  fi
+  sig="$(sync_signature)"
+  path="$(brain_dir)/sync.sig"
+  if [ -f "$path" ] && [ "$(cat "$path" 2>/dev/null)" = "$sig" ]; then
+    printf 'sync: unchanged\n'
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'sync: the declaration has changed; a real run would project it now\n'
+    return 0
+  fi
+  # In a subshell: cmd_sync dies on a config that declares nothing, and a die is
+  # an exit. A sonar must not end because the connections half had nothing to do.
+  # cmd_sync stores the signature itself, on success only, so a failed
+  # projection is retried on the next run rather than recorded as done.
+  ( cmd_sync ) || warn "the projection did not finish; the next samepage will try it again"
+}
+
+# Beat two. Every pane on this repository is put on the board; only the ones
+# whose note has gone stale, and that nobody has messaged lately, are pulsed.
+sonar_pulse() {
+  local rows driver target provider pid cwd pane root self self_branch
+  local pulse_cut branch wpath before line now candidates per_branch newest pulsed
+  local self_cmux self_tmux seen_other n=0 quiet=0
+  self="$(detect_self)"
+  self_branch="$(current_branch)"
+  pulse_cut="$(iso_ago "$PULSE_MIN")"
+  self_cmux="$(mux_self_target cmux)"
+  self_tmux="$(mux_self_target tmux)"
+  # FAIL CLOSED, ALWAYS. Every pane below is kept or skipped by comparing it to
+  # the caller's own surface, so an empty answer excludes nobody and the pulse
+  # lands in the pane the founder is reading. Sending nothing is a wasted run;
+  # sending to yourself is the exact noise this version exists to end.
+  if self_pane_unknown; then
+    info "cannot tell which pane is mine; no pulse sent"
+    return 0
+  fi
+  root="$(cd "$PROJECT" 2>/dev/null && pwd -P)" || root="$PROJECT"
+  rows="$(mux_rows)"
+  if [ -z "$rows" ]; then
+    seen_other="$(unmatched_labels)"
+    [ -n "$seen_other" ] && info "these were running and are not on the known list: $seen_other"
+    return 0
+  fi
+  now="$(date -u +%s)"
+  candidates="$(mktemp)"
+  while IFS="	" read -r driver target provider pid cwd pane; do
+    [ -n "$target" ] || continue
+    case "$driver" in
+      cmux) [ -n "$self_cmux" ] && [ "$target" = "$self_cmux" ] && continue ;;
+      tmux) [ -n "$self_tmux" ] && [ "$target" = "$self_tmux" ] && continue ;;
+    esac
+    # An agent inside tmux inside cmux is reported by both drivers and is one
+    # pane. The agent's pid is the same either way, so it is the identity.
+    case " $SEEN_PIDS " in
+      *" $pid "*) continue ;;
+    esac
+    SEEN_PIDS="$SEEN_PIDS $pid"
+    cwd="$(cd "$cwd" 2>/dev/null && pwd -P)" || continue
+    belongs_to_project "$cwd" "$root" || continue
+    branch="$(pane_branch "$cwd")"
+    # ON THE BOARD WHETHER OR NOT IT IS PULSED. A pane that needs nothing asked
+    # of it is still a pane the next digest should name.
+    roster_upsert "$provider" "$provider" "$target" "$pane" "$cwd" "$branch"
+    # NO EMPTY COLUMN EVER LEAVES THIS LOOP. Tab is IFS whitespace, so `read`
+    # strips a leading empty field and collapses two tabs into one: a pane that
+    # had never been pulsed produced a record one column short, the branch name
+    # was read as the timestamp, and every branch then compared as "pulsed
+    # recently" and went unasked. A dash is the empty value everywhere below.
+    pulsed="$(roster_pulsed_at "$target")"
+    [ -n "$pulsed" ] || pulsed="-"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$branch" "$driver" "$target" "$provider" "$pulsed" >>"$candidates"
+  done <<EOF
+$rows
+EOF
+
+  # ONE NOTE PER BRANCH, SO ONE PULSE PER BRANCH. Two panes on one branch share
+  # `wip/<branch>.md` by contract, so pulsing both asks one question twice and
+  # invites two agents to write the same file at the same moment: the second
+  # write wins and the first pane's answer is gone. The most recently seen pane
+  # on the branch is asked; the newest pulsed_at across every pane on it decides
+  # whether the branch has been asked lately at all.
+  per_branch="$(awk -F '\t' '
+    {
+      if (!($1 in seen)) { seen[$1] = 1; order[++n] = $1 }
+      last[$1] = $0
+      if ($5 > newest[$1]) newest[$1] = $5
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        seen_at = newest[order[i]]
+        if (seen_at == "") seen_at = "-"
+        printf "%s\t%s\n", seen_at, last[order[i]]
+      }
+    }
+  ' "$candidates")"
+  rm -f "$candidates"
+  [ -n "$per_branch" ] || return 0
+
+  while IFS="	" read -r newest branch driver target provider pulsed; do
+    [ -n "$target" ] || continue
+    wpath="$(branch_wip_path "$branch")"
+    before="$(file_mtime "$wpath")"
+    # A NOTE WRITTEN MINUTES AGO IS AN ANSWER ALREADY GIVEN.
+    if [ "$before" != 0 ] && [ "$((now - before))" -lt "$((STALE_MIN * 60))" ]; then
+      quiet=$((quiet + 1))
+      continue
+    fi
+    if [ "$newest" != "-" ] && [ "$newest" \> "$pulse_cut" ]; then
+      quiet=$((quiet + 1))
+      continue
+    fi
+    line="$(pulse_line "$self" "$self_branch" "${TASK:-no task named yet}")"
+    if [ "$DRY_RUN" = 1 ]; then
+      info "dry-run pulse $provider on $driver $target"
+      info "dry-run would send: $line"
+    else
+      if ! mux_send "$driver" "$target" "$line"; then
+        warn "could not reach $target ($provider via $driver)"
+        continue
+      fi
+      roster_mark_pulsed "$target"
+      append_event "pulse" "$self" "$provider $target"
+      printf '%s\t%s\t%s\t%s\n' "$provider" "$branch" "$wpath" "$before" >>"$SONAR_PENDING"
+    fi
+    n=$((n + 1))
+  done <<EOF
+$per_branch
+EOF
+  if [ "$n" = 0 ] && [ "$quiet" -gt 0 ]; then
+    info "$quiet branch(es) here already, all settled; nothing sent"
+  fi
+}
+
+# Beat three. A pane has answered when its note is not the file it was before
+# the pulse, which is true whether the note was rewritten or written for the
+# first time. Returns the ones that stayed silent, one "provider on branch" each.
+sonar_reflect() {
+  local wait_secs="$1" waited=0 unanswered provider branch wpath before
+  [ -s "$SONAR_PENDING" ] || return 0
+  while :; do
+    unanswered=""
+    while IFS="	" read -r provider branch wpath before; do
+      [ -n "$wpath" ] || continue
+      [ "$(file_mtime "$wpath")" != "$before" ] && continue
+      unanswered="${unanswered}${provider} on ${branch}"$'\n'
+    done <"$SONAR_PENDING"
+    [ -z "$unanswered" ] && break
+    [ "$waited" -ge "$wait_secs" ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf '%s' "$unanswered"
+}
+
+cmd_sonar() {
+  require_project
+  local created=0 unanswered count names plural
+  if [ ! -d "$(brain_dir)" ]; then
+    init_local
+    created=1
+  fi
+  require_brain
+  register_self
+  # A no-op when nothing is missing, which is why it can run every time: a brain
+  # that grew a new machine-local file after its init would otherwise have it
+  # sitting in the founder's next commit.
+  ensure_brain_ignored
+  sonar_sync_gate
+  SONAR_PENDING="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$SONAR_PENDING'" EXIT
+  sonar_pulse
+  unanswered="$(sonar_reflect "$SONAR_WAIT")"
+  digest_text
+  write_status
+  [ "$created" = 1 ] && info "brain created at $(brain_dir)"
+  if [ -n "$unanswered" ]; then
+    count="$(printf '%s\n' "$unanswered" | awk 'NF' | wc -l | tr -d ' ')"
+    names="$(printf '%s\n' "$unanswered" | awk 'NF { printf "%s%s", (n++ ? ", " : ""), $0 } END { if (n) print "" }')"
+    if [ "$count" = 1 ]; then plural=""; else plural="s"; fi
+    info "$count pane$plural did not answer within ${SONAR_WAIT}s ($names); its note may be stale"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_help() {
+  cat <<EOF
+samepage $VERSION: one command that puts this pane on the same page as the rest
+
+Usage:
+  samepage [--task TEXT] [--wait N] [--dry-run]
+
+That is the whole tool. With no command it does three things in a few seconds:
+it creates the shared brain if this repository has none, pings every other live
+agent pane on this repository for a one-line status (only the ones whose note
+has gone stale, and never the same pane twice in ten minutes), then prints a
+digest of at most forty lines: who is open and what each is doing, the live
+memory rows, the last lessons, and OVERLAP when your task touches another
+pane's work.
+
+  --task TEXT       What you are about to do. It goes into the message the
+                    other panes get, and it turns on the OVERLAP section.
+  --wait N          Seconds to wait for the other panes to answer (default 8)
+  --dry-run         Print what it would send, and send nothing
+
+Writing back
+  wip [text]        What is in flight on this branch. Write it EARLY.
+  remember <text>   A durable lesson, into the shared log
+  recall <query>    Search the log, the notes and the memory estate
+  handoff <to> <text>
+                    Leave work for another provider
+
+Internals (you rarely need these)
+  prime             The digest alone, with no ping. Add --full for the long
+                    form: protocol, memory index, skills, status.
+  init              Write the brain and reach the panes already open. A bare
+                    samepage does this for you on a first run.
+  sync              Project the primary harness's MCP servers onto the others
+  adopt             Tell the panes already open that this project has a brain
+  status | board    Refresh and print the one-screen board
+  doctor            What is installed, authenticated, linked and inited
+  providers         Detected coding-agent CLIs
+  spawn <provider>  Open a cmux pane and launch that CLI into the brain
+  fleet             Spawn every other detected provider
+  install           Copy CLI + templates to ~/.local
+
+Flags for those
+  --project DIR     Project root (default: git toplevel or cwd)
+  --as PROVIDER     Who you are (claude|codex|grok|gemini|opencode|antigravity)
+  --providers LIST  Comma-separated extras for fleet/init (default: detected)
+  --spawn           init: also open a fresh pane per missing provider
+  --dir DIR         spawn split direction (right|left|up|down, default right)
+  --full            prime: the long form instead of the digest
+
+The brain lives at the MAIN checkout, so every worktree of this repository
+shares one board, one set of notes and one log.
+
+sync reads the primary harness's own config (~/.claude.json) as the
+declaration. It never writes a secret anywhere: Codex gets the NAME of an
+environment variable, Gemini gets the literal \$VAR it expands at read time,
+and your shell profile gets a line that derives the token at shell start.
+Rotate a key in the primary config and every harness follows.
+EOF
+}
+
+cmd_providers() {
+  local p bin
+  printf '%-10s %s\n' "PROVIDER" "BIN"
+  for p in $KNOWN_PROVIDERS; do
+    bin="$(provider_bin "$p")"
+    if [ -n "$bin" ]; then
+      printf '%-10s %s\n' "$p" "$bin"
+    else
+      printf '%-10s (missing)\n' "$p"
+    fi
+  done
+}
+
+cmd_doctor() {
+  require_project
+  local ok=0
+  printf 'samepage %s\n' "$VERSION"
+  printf 'kit root:  %s\n' "$KIT_ROOT"
+  printf 'project:   %s\n' "$PROJECT"
+  printf 'self:      %s\n' "$(detect_self)"
+  printf '\nproviders:\n'
+  cmd_providers | sed 's/^/  /'
+  printf '\ncmux:      '
+  if [ -z "$(cmux_bin)" ]; then
+    printf 'not on PATH\n'
+    ok=1
+  elif cmux_ok; then
+    printf 'inside a live workspace (%s)\n' "$(cmux_caller_surface)"
+  else
+    printf 'installed, but this shell is not inside a cmux pane\n'
+    ok=1
+  fi
+  printf 'brain:     '
+  if [ -d "$(brain_dir)" ]; then
+    printf '%s\n' "$(brain_dir)"
+  else
+    printf 'not inited (run samepage init)\n'
+    ok=1
+  fi
+
+  # A DANGLING LINK IS THE FAILURE THAT LOOKS LIKE AN EMPTY BRAIN. The estate
+  # path is derived, so renaming the folder or moving the repo leaves a link
+  # that resolves to nothing, and every harness then reads a project with no
+  # memory and no skills without one of them saying so.
+  #
+  # AND "NOT LINKED" IS NOT ONE STATE BUT TWO. init only links what exists, so
+  # a missing link usually means there is nothing on this machine to link to,
+  # most often the artifacts mirror, which many projects never grow. Reported as
+  # "run samepage init" that is advice which can never work, and the founder
+  # re-runs init for ever waiting for a link it is right to skip. Say which one
+  # it is, and name the path the mirror would live at.
+  printf '\nlinks:\n'
+  local name path src
+  for name in memory skills artifacts; do
+    path="$(brain_dir)/$name"
+    src="$(link_source "$name")"
+    if [ -e "$path" ]; then
+      printf '  %-10s %s\n' "$name" "$(cd "$path" 2>/dev/null && pwd -P || printf '%s' "$path")"
+    elif [ -L "$path" ]; then
+      printf '  %-10s dangling (folder moved or estate renamed?): re-run samepage init to re-derive\n' "$name"
+      ok=1
+    elif [ ! -d "$src" ]; then
+      printf '  %-10s nothing to link: no %s on this machine\n' "$name" "$src"
+    else
+      printf '  %-10s not linked (run samepage init)\n' "$name"
+    fi
+  done
+
+  # Both are load-bearing and neither is guaranteed on a fresh machine: jq
+  # derives every token at shell start, python3 does every piece of JSON work.
+  printf '\ntools:\n'
+  local tool
+  for tool in jq python3; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      printf '  %-10s %s\n' "$tool" "$(command -v "$tool")"
+    else
+      printf '  %-10s missing (samepage sync and doctor need it)\n' "$tool"
+      ok=1
+    fi
+  done
+
+  printf '\nsync vars:\n'
+  local cfg profile kind url var value any=0
+  cfg="$(claude_config)"
+  profile="$(shell_profile)"
+  if [ ! -f "$cfg" ]; then
+    printf '  no primary-harness config at %s\n' "$cfg"
+  else
+    while IFS=$'\t' read -r name kind url var; do
+      [ -n "$var" ] || continue
+      any=1
+      if [ ! -f "$profile" ] || ! grep -qE "^[[:space:]]*export[[:space:]]+$var=" "$profile"; then
+        printf '  %-24s not exported yet (run samepage sync)\n' "$var"
+        ok=1
+        continue
+      fi
+      # The VALUE is never printed, here or anywhere. Only whether it arrived:
+      # a var that derives to nothing looks exactly like a broken server from
+      # inside the other harness, which is a long way to go for a rotated key.
+      value=""
+      if command -v jq >/dev/null 2>&1; then
+        value="$(derive_auth "$name" "$cfg")"
+      fi
+      if [ -n "$value" ]; then
+        printf '  %-24s exported, derives a value\n' "$var"
+      else
+        printf '  %-24s exported, but derives EMPTY (re-check the key in %s)\n' "$var" "$cfg"
+        ok=1
+      fi
+    done <<EOF_VARS
+$(claude_servers)
+EOF_VARS
+    [ "$any" = 1 ] || printf '  (no bearer-token servers declared)\n'
+  fi
+
+  [ "$ok" = 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# sync: project the primary harness's connections onto every other harness
+# ---------------------------------------------------------------------------
+
+cmd_sync() {
+  require_brain
+  local cfg count rc=0 plural
+  cfg="$(claude_config)"
+  [ -f "$cfg" ] || die "no primary-harness config at $cfg (set SAMEPAGE_CLAUDE_CONFIG)"
+
+  # jq is what derives every token at shell start, so its absence decides what
+  # this run may honestly write. Ask once, before anything is projected.
+  if command -v jq >/dev/null 2>&1; then JQ_PRESENT=1; else JQ_PRESENT=0; fi
+
+  SERVERS_FILE="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$SERVERS_FILE'" EXIT
+  claude_servers >"$SERVERS_FILE" || rc=$?
+  # A file that will not parse is a different problem from a file that parses
+  # and declares nothing, and telling the founder to add a server when the real
+  # fault is a stray comma sends them to the wrong place. Both mutate nothing.
+  if [ "$rc" = 3 ]; then
+    die "$cfg is not valid JSON"
+  fi
+  count="$(grep -c . "$SERVERS_FILE" || true)"
+  [ "$count" -gt 0 ] || die "no mcpServers declared in $cfg"
+
+  # Size the columns to the names actually present. A fixed width turns into a
+  # ragged list the first time someone registers a long server name, and this
+  # report is the one place three harnesses are readable side by side.
+  NAME_WIDTH="$(awk -F '\t' 'length($1) > m { m = length($1) } END { print (m < 12 ? 12 : m) + 1 }' "$SERVERS_FILE")"
+  VAR_WIDTH="$(awk -F '\t' 'length($4) > m { m = length($4) } END { print (m < 20 ? 20 : m) + 1 }' "$SERVERS_FILE")"
+
+  printf 'CONNECTIONS\n'
+  printf '  declared by  %s\n' "$cfg"
+  printf '  servers      %s\n\n' "$count"
+
+  sync_codex
+  printf '\n'
+  sync_gemini
+  printf '\n'
+  sync_profile
+  printf '\n'
+  trust_posture
+  printf '\n'
+  verify_connections
+
+  append_event "sync" "$(detect_self)" "$cfg ($count servers)"
+
+  # A caller that reads only the status is the one this protects: a harness that
+  # lost a server, or a var that could not be written, is not a successful sync.
+  if [ "$SYNC_FAILURES" -gt 0 ]; then
+    if [ "$SYNC_FAILURES" = 1 ]; then plural=""; else plural="s"; fi
+    printf '\nsamepage: %s server%s did not project. See the lines above.\n' \
+      "$SYNC_FAILURES" "$plural" >&2
+    return 1
+  fi
+
+  # WHAT THE SONAR COMPARES NEXT TIME, AND ONLY AFTER A RUN THAT WORKED. Written
+  # unconditionally it records a failed projection as done, and the gate then
+  # skips the retry for as long as the declaration stays put, which is for ever.
+  if [ "$DRY_RUN" != 1 ]; then
+    sync_signature >"$(brain_dir)/sync.sig"
+  fi
+}
+
+# EVERYTHING THIS MACHINE NEEDS, AND NOTHING THAT SPEAKS TO ANOTHER PANE.
+# Split out of init so the sonar can create a brain in silence on a first run:
+# the same files, the same refresh lines, nobody messaged.
+init_local() {
+  require_project
+  local self home
+  self="$(detect_self)"
+  # THE FILES INIT WRITES INTO THE REPO BELONG WHERE THE BRAIN DOES. Run from a
+  # linked worktree, every one of them (the project skill, the three harness
+  # links, the AGENTS.md and CLAUDE.md pointers) used to land in the WORKTREE
+  # while the brain went to the main checkout: the skills link then pointed at a
+  # directory in another checkout, the pointer block was invisible to a pane at
+  # the root, and the founder got a dirty worktree they never asked for.
+  home="$(main_checkout)"
+
+  # LOCAL FIRST, MULTIPLEXER LAST, AND NOTHING BETWEEN THEM MAY EXIT.
+  # Every step below writes to this machine and cannot fail across a process
+  # boundary. The only steps that can are the adopt and the spawn at the end,
+  # and the spawn used to `die`, so a lost pane took the report of all of this
+  # with it and the founder was told only that a surface could not be found.
+  # Keep this order, and keep a spawn failure recoverable.
+  if [ "$DRY_RUN" = 1 ]; then
+    info "dry-run init project=$PROJECT as=$self spawn=$SPAWN"
+  else
+    mkdir -p "$(brain_dir)"
+    # ONLY IF MISSING. init is safe to run twice, and the second run used to
+    # overwrite this file unconditionally: any local edit gone, and a dirty
+    # tree in every project that tracks it.
+    if [ ! -f "$(brain_dir)/PROTOCOL.md" ]; then
+      cp "$(template PROTOCOL.md)" "$(brain_dir)/PROTOCOL.md"
+    fi
+    if [ ! -f "$(roster_path)" ]; then
+      roster_header >"$(roster_path)"
+    fi
+    if [ ! -f "$(events_path)" ]; then
+      : >"$(events_path)"
+    fi
+
+    # THE SKILL BEFORE THE LINKS, because .samepage/skills points at the
+    # directory this creates. Installed after them, a fresh project got no
+    # skills link on its FIRST init: the directory did not exist yet, the link
+    # was skipped, and only a second init ever joined them up.
+    # The canonical copy, then links from every other harness's directory.
+    install_project_skill "$home/.claude/skills/samepage"
+    link_project_skill "$home/.agents/skills/samepage" "$home/.claude/skills/samepage"
+    link_project_skill "$home/.codex/skills/samepage" "$home/.claude/skills/samepage"
+    link_project_skill "$home/.grok/skills/samepage" "$home/.claude/skills/samepage"
+
+    # LINK, never copy. Three things every agent should see and none of which
+    # samepage owns: the memory estate, the project's real skills, and the
+    # artifacts mirror. A symlink means there is exactly one copy to keep true,
+    # and link_source is the single place that says where each one points.
+    #
+    # -sfn, not -s: `! -e` is TRUE for a dangling link, so a link whose target
+    # moved got here and `ln -s` failed with "File exists", which under set -e
+    # ended the run. That is exactly the case doctor sends the founder here to
+    # fix ("re-run samepage init to re-derive"), so the advice used to crash.
+    local name src
+    for name in memory skills artifacts; do
+      src="$(link_source "$name")"
+      if [ -d "$src" ] && [ ! -e "$(brain_dir)/$name" ]; then
+        ln -sfn "$src" "$(brain_dir)/$name"
+      fi
+    done
+    mkdir -p "$(wip_dir)"
+    if [ ! -f "$(shared_log)" ]; then
+      cp "$(template SHARED.md)" "$(shared_log)"
+    fi
+    # The estate is the founder's private strategy and the wip record is
+    # per-machine noise. Neither is ours to commit, and a symlink committed by
+    # accident would resolve to nothing on any other machine.
+    ensure_brain_ignored
+    inject_block "$home/AGENTS.md" "$(template AGENTS-block.md)"
+    # ONE FILE OR TWO. A repo may make AGENTS.md a symlink to CLAUDE.md so that
+    # every harness reads one constitution (this one does). Injecting a second,
+    # different block into the same inode would replace the first, because both
+    # blocks share the samepage markers. So inject the Claude block only when
+    # the two are genuinely separate files.
+    if [ -f "$home/CLAUDE.md" ] || [ "$self" = "claude" ]; then
+      local agents_real claude_real
+      agents_real="$(cd "$(dirname "$home/AGENTS.md")" 2>/dev/null && pwd -P)/$(basename "$(readlink "$home/AGENTS.md" 2>/dev/null || echo AGENTS.md)")"
+      claude_real="$(cd "$(dirname "$home/CLAUDE.md")" 2>/dev/null && pwd -P)/CLAUDE.md"
+      if [ "$agents_real" != "$claude_real" ]; then
+        inject_block "$home/CLAUDE.md" "$(template CLAUDE-block.md)"
+      else
+        info "AGENTS.md and CLAUDE.md are one file; injected once"
+      fi
+    fi
   fi
 }
 
 cmd_init() {
-  local target="${1:-.}"
-  mkdir -p "$target"
-  cd "$target"
-  mkdir -p .samepage/memory .samepage/skills
-  if [ -f AGENTS.md ]; then
-    info "AGENTS.md already exists — keeping yours"
+  require_project
+  local extras="${PROVIDERS_FLAG:-}"
+  local self created=0
+  self="$(detect_self)"
+  [ -d "$(brain_dir)" ] || created=1
+  init_local
+
+  register_self
+  append_event "init" "$self" "$PROJECT"
+
+  # ADOPT WHAT IS OPEN; SPAWN ONLY IF ASKED. The panes that matter are the
+  # ones the founder already has. Opening a fresh fleet by default answers a
+  # question nobody asked and leaves every existing pane as ignorant as it was.
+  local do_spawn=0
+  case "$SPAWN" in
+    1|yes|true) do_spawn=1 ;;
+    *) do_spawn=0 ;;
+  esac
+
+  info "brain live at $(brain_dir)"
+  # ONLY ON THE RUN THAT CREATED IT. Typing into every open pane is how a first
+  # run makes a brain real, and it is also how a settled workspace goes berserk
+  # when the verb is run again. A later run that wants the panes reached is a
+  # bare `samepage`, which knows who it has already spoken to and when.
+  if [ "$created" != 1 ]; then
+    info "the brain was already here; run samepage to reach the other panes"
+  elif cmux_ok || have_tmux; then
+    cmd_adopt_inner
   else
-    cp "$TEMPLATES/AGENTS.md" AGENTS.md
-    ok "AGENTS.md created (edit the project-context section)"
+    info "no supported multiplexer here (cmux or tmux)"
+    info "run 'samepage' once in each agent you have open"
   fi
-  [ -f .samepage/memory/MEMORY.md ] || cp "$TEMPLATES/MEMORY.md" .samepage/memory/MEMORY.md
-  [ -f .samepage/BOOTSTRAP.md ] || cp "$TEMPLATES/BOOTSTRAP.md" .samepage/BOOTSTRAP.md
-  [ -d .samepage/skills/remember ] || cp -R "$TEMPLATES/skills/remember" .samepage/skills/remember
-  link_agents
-  bold "Next: samepage bootstrap"
+  if [ "$do_spawn" = 1 ]; then
+    cmd_fleet_inner "$self" "$extras"
+  fi
+  write_status
+  cmd_status_print
+
+  # A run that wrote the whole brain and then lost a pane is neither a success
+  # nor a failure, so say both halves. The status above is the half that worked;
+  # this names the half that did not, and the exit code carries it so a script
+  # is not told an init went fine when a pane never opened.
+  report_spawn_failures
 }
 
-cmd_sync() {
-  [ -f AGENTS.md ] || die "no AGENTS.md here — run 'samepage init' first"
-  mkdir -p .samepage/memory .samepage/skills
-  link_agents
+cmd_remember() {
+  require_brain
+  local body="$*"
+  [ -n "$body" ] || die "usage: samepage remember <text>"
+  local self
+  self="$(detect_self)"
+  if [ "$DRY_RUN" = 1 ]; then
+    info "dry-run remember $body"
+    return
+  fi
+  # Into the shared log, NEVER into the estate's own MEMORY.md: that file is a
+  # curated one-line-per-memory index and an appended paragraph corrupts it.
+  printf -- '- %s (%s) %s\n' "$(date +%Y-%m-%d)" "$self" "$body" >>"$(shared_log)"
+  append_event "remember" "$self" "$body"
+  write_status
+  info "remembered"
 }
 
-cmd_doctor() {
-  local row name bin inst auth
-  bold "agent CLIs"
-  for row in "${AGENTS[@]}"; do
-    IFS='|' read -r name bin inst auth <<EOF
-$row
-EOF
-    if command -v "$bin" >/dev/null 2>&1; then
-      ok "$name"
-    else
-      bad "$name — not installed (try: $inst)"
+cmd_recall() {
+  require_brain
+  local q="$*"
+  [ -n "$q" ] || die "usage: samepage recall <query>"
+  # Search everything an agent can read here: the shared log, this branch's
+  # in-flight record, and every file in the linked estate. The estate is the
+  # bulk of it and is exactly what a fresh pane in another provider is missing.
+  grep -i -n -e "$q" "$(shared_log)" 2>/dev/null || true
+  [ -f "$(wip_path)" ] && grep -i -n -e "$q" "$(wip_path)" 2>/dev/null || true
+  # RESOLVE THE LINK FIRST, then search the real directory. Whether grep -r or
+  # -R follows a symlink given as the top-level argument varies between greps,
+  # and a search that silently finds nothing is worse than one that errors.
+  local est hits f
+  est="$(cd "$(brain_dir)/memory" 2>/dev/null && pwd -P || true)"
+  if [ -n "$est" ] && [ -d "$est" ]; then
+    hits="$(grep -ril -e "$q" "$est" 2>/dev/null | head -n 12 || true)"
+    if [ -n "$hits" ]; then
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '%s: %s\n' "$f" "$(grep -i -m1 -e "$q" "$f" 2>/dev/null | cut -c1-120)"
+      done <<EOF_HITS
+$hits
+EOF_HITS
     fi
-  done
-  bold "shared layer"
-  [ -f AGENTS.md ] && ok "AGENTS.md" || bad "AGENTS.md missing — run 'samepage init'"
-  [ -f .samepage/memory/MEMORY.md ] && ok ".samepage/memory/MEMORY.md" || bad "shared memory missing"
-  [ -d .samepage/skills ] && ok ".samepage/skills/" || bad "shared skills dir missing"
-  local l
-  for l in CLAUDE.md GEMINI.md .claude/skills; do
-    if [ -L "$l" ]; then
-      ok "$l -> $(readlink "$l")"
-    elif [ -e "$l" ]; then
-      warn "$l is a real file/dir, not a symlink — that's a context gap waiting to happen"
-    else
-      bad "$l not linked — run 'samepage sync'"
-    fi
-  done
+  fi
+  # A while-read loop ends with read returning 1, which under set -e would make
+  # a successful search look like a failed command to the caller.
   return 0
 }
 
-cmd_bootstrap() {
-  if [ ! -f AGENTS.md ] || [ ! -d .samepage ]; then
-    info "no shared layer here yet — running init first"
-    cmd_init .
+# THE IN-FLIGHT RECORD, and the reason this kit exists at all.
+#
+# MEMORY is what is true across sessions. WIP is what is true right now on THIS
+# branch: what I am part-way through, what is decided, what is next, whose move
+# it is. A session that dies of a crash or a full context window writes nothing,
+# so this is written EARLY and updated, never saved at the end. Reading it is
+# how a fresh pane in another provider picks up a thread it never saw.
+cmd_wip() {
+  require_brain
+  mkdir -p "$(wip_dir)"
+  local self body path
+  self="$(detect_self)"
+  body="$*"
+  path="$(wip_path)"
+  if [ -z "$body" ]; then
+    if [ -f "$path" ]; then cat "$path"; else
+      printf 'no in-flight record for %s yet. write one:\n  samepage wip "<what you are part-way through>"\n' "$(current_branch)"
+    fi
+    return 0
   fi
-
-  local pick="${1:-}" row name bin inst auth i n
-  if [ -z "$pick" ]; then
-    bold "Which provider do you trust most?"
-    i=1
-    for row in "${AGENTS[@]}"; do
-      IFS='|' read -r name bin inst auth <<EOF
-$row
-EOF
-      if command -v "$bin" >/dev/null 2>&1; then
-        printf '  %d) %s (installed)\n' "$i" "$name"
-      else
-        printf '  %d) %s\n' "$i" "$name"
-      fi
-      i=$((i + 1))
-    done
-    printf '> '
-    read -r pick
-  fi
-
-  # accept a number or a name
-  case "$pick" in
-    [1-9])
-      [ "$pick" -le "${#AGENTS[@]}" ] || die "no option $pick"
-      n=1
-      for row in "${AGENTS[@]}"; do
-        if [ "$n" -eq "$pick" ]; then break; fi
-        n=$((n + 1))
-      done
-      ;;
-    *)
-      pick="$(printf '%s' "$pick" | tr '[:upper:]' '[:lower:]')"
-      row="$(agent_row "$pick")" || die "unknown provider '$pick' (try: claude, codex, gemini, opencode, amp, goose, aider)"
-      ;;
-  esac
-  IFS='|' read -r name bin inst auth <<EOF
-$row
-EOF
-
-  if ! command -v "$bin" >/dev/null 2>&1; then
-    bad "$name is not installed."
-    info "install: $inst"
-    info "auth:    $auth"
-    info "then rerun: samepage bootstrap $name"
-    exit 1
-  fi
-
-  info "if you haven't authenticated $name yet: $auth"
-  bold "Handing over to $name with the bootstrap prompt..."
-  case "$name" in
-    claude) exec claude "$(cat .samepage/BOOTSTRAP.md)" ;;
-    codex)  exec codex "$(cat .samepage/BOOTSTRAP.md)" ;;
-    gemini) exec gemini -i "$(cat .samepage/BOOTSTRAP.md)" ;;
-    *)
-      if command -v pbcopy >/dev/null 2>&1; then
-        pbcopy < .samepage/BOOTSTRAP.md
-        ok "bootstrap prompt copied to your clipboard — start '$bin' and paste it"
-      else
-        info "start '$bin' and paste the contents of .samepage/BOOTSTRAP.md"
-      fi
-      ;;
-  esac
+  if [ "$DRY_RUN" = 1 ]; then info "dry-run wip $body"; return; fi
+  {
+    printf '# in flight: %s\n\n' "$(current_branch)"
+    printf -- '- updated %s by %s\n' "$(human_now)" "$self"
+    printf -- '- head: %s\n\n' "$(git -C "$PROJECT" log -1 --format='%h %s' 2>/dev/null || echo unknown)"
+    printf '%s\n' "$body"
+  } >"$path"
+  append_event "wip" "$self" "$(current_branch)"
+  info "in-flight record written for $(current_branch)"
 }
 
-usage() {
-  cat <<EOF
-samepage $VERSION — one shared context layer for every coding agent
-
-usage: samepage <command>
-
-  init [dir]            create the shared layer (AGENTS.md, .samepage/) and link agents to it
-  bootstrap [provider]  hand the setup of all other agents to the one you trust
-  doctor                show which agents are installed and whether the layer is intact
-  sync                  (re)create the symlinks after cloning or adding agents
-  version               print version
-EOF
+# PRIMING IS JOINING. Every command that reads the brain puts the pane on the
+# board first, so the roster keeps itself true with no verb to remember and no
+# way for a pane to be working in here while the board says it is not.
+register_self() {
+  local self surface
+  self="$(detect_self)"
+  [ "$self" = "unknown" ] && return 0
+  [ "$DRY_RUN" = 1 ] && return 0
+  if cmux_ok; then
+    # A ROW IS A SURFACE. Written with an empty one from inside cmux it keys on
+    # the provider name instead, so the next pane of the same provider evicts
+    # it, and nothing on the board can be excluded from a pulse by surface.
+    surface="$(mux_self_target cmux)"
+    if [ -z "$surface" ]; then
+      warn "cannot tell which pane is mine; leaving the board alone"
+      return 0
+    fi
+    roster_upsert "$self" "$self" "$surface" "$(cmux_caller_pane)" "$PROJECT"
+  else
+    roster_upsert "$self" "$self" "-" "-" "$PROJECT"
+  fi
+  write_status
 }
 
-case "${1:-help}" in
-  init)      shift; cmd_init "$@" ;;
-  bootstrap) shift; cmd_bootstrap "$@" ;;
-  doctor)    shift; cmd_doctor "$@" ;;
-  sync)      shift; cmd_sync "$@" ;;
-  version|-v|--version) printf 'samepage %s\n' "$VERSION" ;;
-  help|-h|--help) usage ;;
-  *) usage; exit 1 ;;
+cmd_prime() {
+  require_brain
+  register_self
+  # The digest is the whole point of a boot. The long form is still here for the
+  # times a pane wants the protocol, the skills list and the log in one screen,
+  # and it is one flag away rather than the thing every pane pays for.
+  if [ "$FULL" = 1 ]; then
+    prime_text
+  else
+    digest_text
+  fi
+}
+
+cmd_status_print() {
+  require_brain
+  write_status
+  if [ -f "$(brain_dir)/STATUS.md" ]; then
+    cat "$(brain_dir)/STATUS.md"
+  fi
+}
+
+cmd_status() {
+  require_brain
+  cmd_status_print
+}
+
+cmd_handoff() {
+  require_brain
+  local to="${1:-}"
+  shift || true
+  local body="$*"
+  [ -n "$to" ] && [ -n "$body" ] || die "usage: samepage handoff <provider> <text>"
+  local self
+  self="$(detect_self)"
+  append_event "handoff" "$self->$to" "$body"
+  write_status
+  if cmux_ok; then
+    local surface
+    surface="$(roster_surface_for "$to" || true)"
+    cmux notify --title "samepage" --body "$self -> $to: $body" >/dev/null 2>&1 || true
+    if [ -n "$surface" ] && [ "$surface" != "-" ]; then
+      info "handoff recorded; $to is $surface"
+    else
+      info "handoff recorded; $to has no pane yet (samepage spawn $to)"
+    fi
+  else
+    info "handoff recorded"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Spawn / fleet
+# ---------------------------------------------------------------------------
+
+# A NEWLINE MAY NEVER REACH awk -v, AND BOTH LISTS HERE ARE ONE ID PER LINE.
+# BSD/macOS awk refuses a newline inside a -v assignment outright: it prints
+# "awk: newline in string pane:1 ... at source line 1" and runs no program at
+# all. The old shape passed the whole before-list as -v b="$before", so on the
+# founder's own machine every fallback lookup returned nothing and spawn died
+# with "could not find the new cmux surface after split" AFTER init had already
+# finished its local work. So the before-list is fed as INPUT, behind a
+# separator line no id can contain (ids are pane:N and surface:N, never a
+# sentence), and the program switches on the separator instead of a variable.
+#
+# Audited every other `awk -v` in the tool: the roster name, the roster key, the
+# two codex server-name lookups and the adopt walker's root pids all take single
+# tokens or a space-separated list on one line, and prune_roster flattens the
+# live surface list with `tr` for the same reason. This was the only site handed
+# a genuinely multi-line value.
+DIFF_SEPARATOR="--- samepage before/after separator ---"
+
+diff_new_id() {
+  local before="$1" after="$2"
+  {
+    printf '%s\n' "$before"
+    printf '%s\n' "$DIFF_SEPARATOR"
+    printf '%s\n' "$after"
+  } | awk -v sep="$DIFF_SEPARATOR" '
+    $0 == sep { past = 1; next }
+    !past { if ($0 != "") seen[$0] = 1; next }
+    $0 != "" && !($0 in seen) { print; exit }
+  '
+}
+
+parse_new_split() {
+  local out="$1"
+  local surface pane
+  surface="$(printf '%s' "$out" | cmux_json_field '.surface_ref' || true)"
+  pane="$(printf '%s' "$out" | cmux_json_field '.pane_ref' || true)"
+  if [ -z "$surface" ]; then
+    surface="$(printf '%s' "$out" | cmux_json_field '.surface' || true)"
+  fi
+  if [ -z "$pane" ]; then
+    pane="$(printf '%s' "$out" | cmux_json_field '.pane' || true)"
+  fi
+  printf '%s %s\n' "${pane:-}" "${surface:-}"
+}
+
+# A pane that did not open, recorded rather than fatal. The caller decides what
+# a lost pane means: init has already written the brain and still owes the
+# founder a report, while `samepage spawn` has nothing else to do and exits.
+spawn_failed() {
+  local provider="$1" reason="$2"
+  if [ -n "$SPAWN_FAILURES" ]; then
+    SPAWN_FAILURES="$SPAWN_FAILURES"$'\n'"$provider: $reason"
+  else
+    SPAWN_FAILURES="$provider: $reason"
+  fi
+  warn "$provider: $reason"
+}
+
+# The reason a run that lost a pane is still worth reporting: everything local
+# is already on disk by the time this is called. Returns 1 when anything failed,
+# so a caller can carry it into the exit code.
+report_spawn_failures() {
+  [ -n "$SPAWN_FAILURES" ] || return 0
+  info "these panes did not open:"
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    printf 'samepage:   %s\n' "$line" >&2
+  done <<EOF_SPAWN_FAILURES
+$SPAWN_FAILURES
+EOF_SPAWN_FAILURES
+  info "everything above this list is written and needs nothing; open the rest by hand with: samepage spawn <provider>"
+  return 1
+}
+
+spawn_provider() {
+  local provider="$1"
+  local dir="${SPLIT_DIR:-right}"
+  local task="${TASK:-}"
+  if ! is_known_provider "$provider"; then
+    spawn_failed "$provider" "unknown provider"
+    return 1
+  fi
+  local bin
+  bin="$(provider_bin "$provider")"
+  if [ -z "$bin" ]; then
+    spawn_failed "$provider" "not on PATH"
+    return 1
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    info "dry-run spawn $provider dir=$dir task=${task:-none}"
+    return 0
+  fi
+
+  if ! cmux_ok; then
+    spawn_failed "$provider" "not inside cmux (cmux identify failed)"
+    return 1
+  fi
+  require_brain
+
+  local before_panes before_surfaces out parsed pane surface
+  before_panes="$(list_pane_ids)"
+  before_surfaces="$(list_surface_ids)"
+
+  out="$(cmux new-split "$dir" --focus false 2>/dev/null || true)"
+  parsed="$(parse_new_split "$out")"
+  pane="$(printf '%s\n' "$parsed" | awk '{ print $1 }')"
+  surface="$(printf '%s\n' "$parsed" | awk '{ print $2 }')"
+
+  if [ -z "$pane" ]; then
+    pane="$(diff_new_id "$before_panes" "$(list_pane_ids)")"
+  fi
+  if [ -z "$surface" ]; then
+    if [ -n "$pane" ]; then
+      surface="$(surface_in_pane "$pane")"
+    fi
+    if [ -z "$surface" ]; then
+      surface="$(diff_new_id "$before_surfaces" "$(list_surface_ids)")"
+    fi
+  fi
+  if [ -z "$surface" ]; then
+    spawn_failed "$provider" "could not find the new cmux surface after split"
+    return 1
+  fi
+
+  cmux rename-tab --surface "$surface" "$provider" >/dev/null 2>&1 || true
+  cmux send --surface "$surface" "cd $(printf '%q' "$PROJECT")\n" >/dev/null
+  sleep "$WAIT_SECS"
+  cmux send --surface "$surface" "$(provider_launch "$provider")\n" >/dev/null
+  sleep "$WAIT_SECS"
+  local prompt
+  prompt="$(peer_bootstrap_prompt "$provider")"
+  if [ -n "$task" ]; then
+    prompt="${prompt}
+
+First task: ${task}"
+  fi
+  # Collapse to a single send with embedded newlines that cmux treats as Enter.
+  local encoded
+  encoded="$(printf '%s' "$prompt" | python3 -c 'import sys; print(sys.stdin.read().replace("\n", "\\n"))')"
+  cmux send --surface "$surface" "${encoded}\n" >/dev/null
+  # The launched CLI is a TUI now, not the shell, so the newline above types
+  # the prompt without sending it. See the note in cmd_adopt_inner.
+  cmux send-key --surface "$surface" Enter >/dev/null 2>&1 || true
+
+  roster_upsert "$provider" "$provider" "$surface" "${pane:-}" "$PROJECT"
+  append_event "spawn" "$(detect_self)" "$provider $surface"
+  write_status
+  cmux set-status samepage "brain: $(detect_self)+$provider" --icon sparkle --priority 40 >/dev/null 2>&1 || true
+  info "spawned $provider on $surface"
+  printf '%s\n' "$surface"
+}
+
+cmd_spawn() {
+  require_project
+  local provider="${1:-}"
+  [ -n "$provider" ] || die "usage: samepage spawn <provider>"
+  if [ ! -d "$(brain_dir)" ]; then
+    SPAWN=0
+    cmd_init >/dev/null
+  fi
+  spawn_provider "$provider"
+}
+
+fleet_list() {
+  local self="$1"
+  local extras="$2"
+  local p
+  if [ -n "$extras" ]; then
+    printf '%s\n' "$extras" | tr ',' '\n' | tr -d ' '
+    return
+  fi
+  for p in $(detected_providers); do
+    [ "$p" = "$self" ] && continue
+    printf '%s\n' "$p"
+  done
+}
+
+cmd_fleet_inner() {
+  local self="$1"
+  local extras="$2"
+  local list dir=right n=0 p
+  list="$(fleet_list "$self" "$extras")"
+  if [ -z "$list" ]; then
+    info "no extra providers to spawn"
+    return
+  fi
+  for p in $list; do
+    [ "$p" = "$self" ] && continue
+    if [ -z "$(provider_bin "$p")" ]; then
+      warn "skip $p (not on PATH)"
+      continue
+    fi
+    if [ "$n" -eq 0 ]; then
+      dir=right
+    else
+      dir=down
+    fi
+    # spawn_failed has already said which provider and why, and recorded it for
+    # the report at the end. One lost pane never stops the ones after it.
+    SPLIT_DIR="$dir" spawn_provider "$p" || true
+    n=$((n + 1))
+  done
+  if cmux_ok && [ "$DRY_RUN" != 1 ]; then
+    cmux set-status samepage "samepage fleet $n" --icon sparkle --priority 40 >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_fleet() {
+  require_project
+  if [ ! -d "$(brain_dir)" ]; then
+    SPAWN=0
+    cmd_init >/dev/null
+  fi
+  cmd_fleet_inner "$(detect_self)" "${PROVIDERS_FLAG:-}"
+  write_status
+  cmd_status_print
+  report_spawn_failures
+}
+
+cmd_install() {
+  local prefix="${PREFIX:-$HOME/.local}"
+  local dest="$prefix/share/samepage"
+  local bin="$prefix/bin"
+  if [ "$DRY_RUN" = 1 ]; then
+    info "dry-run install $dest and $bin/samepage"
+    return
+  fi
+  mkdir -p "$dest" "$bin"
+  rm -rf "$dest/templates" "$dest/skills" "$dest/bin"
+  mkdir -p "$dest/templates" "$dest/skills" "$dest/bin"
+  cp -R "$KIT_ROOT/templates/." "$dest/templates/"
+  cp -R "$KIT_ROOT/skills/." "$dest/skills/"
+  cp "$KIT_ROOT/bin/samepage" "$dest/bin/samepage"
+  chmod +x "$dest/bin/samepage"
+  ln -sf "$dest/bin/samepage" "$bin/samepage"
+  info "installed $bin/samepage"
+  info "put $bin on PATH if it is not already"
+}
+
+# ---------------------------------------------------------------------------
+# Flag parse + dispatch
+# ---------------------------------------------------------------------------
+
+# A BARE `samepage` IS THE SONAR, because one verb is the whole design. A first
+# argument beginning with a dash is a flag to the sonar rather than a command,
+# so it is left in place for the parser below: `samepage --task "..."` used to
+# be read as a command called --task and then swallow its own argument.
+COMMAND="sonar"
+if [ "$#" -gt 0 ]; then
+  case "$1" in
+    -*) ;;
+    *)
+      COMMAND="$1"
+      shift
+      ;;
+  esac
+fi
+
+PROVIDERS_FLAG=""
+SPLIT_DIR="right"
+TASK=""
+FULL=0
+POSITIONAL=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --project)
+      PROJECT="${2:-}"
+      shift 2
+      ;;
+    --as)
+      LEAD_AS="${2:-}"
+      shift 2
+      ;;
+    --providers)
+      PROVIDERS_FLAG="${2:-}"
+      shift 2
+      ;;
+    --spawn) SPAWN=1; shift ;;
+    --no-spawn) SPAWN=0; shift ;;
+    --dir)
+      SPLIT_DIR="${2:-right}"
+      shift 2
+      ;;
+    --task)
+      TASK="${2:-}"
+      shift 2
+      ;;
+    --wait)
+      # One flag, two waits: the pause after launching a CLI into a fresh pane,
+      # and the seconds the sonar gives the other panes to answer. Nothing ever
+      # does both in one run, and two flags would be one more thing to know.
+      WAIT_SECS="${2:-1}"
+      SONAR_WAIT="${2:-8}"
+      shift 2
+      ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --full) FULL=1; shift ;;
+    --version|-V)
+      printf '%s\n' "$VERSION"
+      exit 0
+      ;;
+    --help|-h)
+      cmd_help
+      exit 0
+      ;;
+    --)
+      shift
+      POSITIONAL="${POSITIONAL:+$POSITIONAL }$*"
+      break
+      ;;
+    -*)
+      die "unknown flag: $1"
+      ;;
+    *)
+      POSITIONAL="${POSITIONAL:+$POSITIONAL }$1"
+      shift
+      ;;
+  esac
+done
+
+# THE PROSE VERBS TAKE THE WHOLE STRING, NEVER A RE-SPLIT ONE.
+# `set -- $POSITIONAL` splits on whitespace AND globs: a note reading "rewriting
+# *.md" came back as a directory listing of the working directory, and runs of
+# spaces collapsed to one. What a founder typed into a note has to survive the
+# argument parser byte for byte. The verbs that take tokens rather than prose
+# still need the split, and they get it with globbing off.
+case "$COMMAND" in
+  wip|remember|recall)
+    set -- "$POSITIONAL"
+    ;;
+  handoff)
+    # One token, then everything else as written.
+    case "$POSITIONAL" in
+      *" "*) set -- "${POSITIONAL%% *}" "${POSITIONAL#* }" ;;
+      *) set -- "$POSITIONAL" ;;
+    esac
+    ;;
+  *)
+    set -f
+    # shellcheck disable=SC2086
+    set -- $POSITIONAL
+    set +f
+    ;;
+esac
+
+case "$COMMAND" in
+  sonar) cmd_sonar ;;
+  help|-h|--help) cmd_help ;;
+  version|--version|-V) printf '%s\n' "$VERSION" ;;
+  init) cmd_init ;;
+  sync) cmd_sync ;;
+  doctor) cmd_doctor ;;
+  providers) cmd_providers ;;
+  prime) cmd_prime ;;
+  wip) cmd_wip "$@" ;;
+  remember) cmd_remember "$@" ;;
+  recall) cmd_recall "$@" ;;
+  status|board) cmd_status ;;
+  handoff) cmd_handoff "$@" ;;
+  adopt) cmd_adopt ;;
+  spawn) cmd_spawn "$@" ;;
+  fleet) cmd_fleet ;;
+  install) cmd_install ;;
+  *) die "unknown command: $COMMAND (try samepage help)" ;;
 esac
